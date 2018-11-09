@@ -1,0 +1,36 @@
+# ZKDatabase
+
+在QuorumPeer 启动前，会先根据配置文件对它进行一系列的初始化，下面我们看看对于ZKDatabase的初始化。
+
+```$xslt
+
+// ZKDatabase 只有一个有参构造函数，参数为FileTxnSnapLog
+// 在初始化ZKDatabase时，FileTxnSnapLog是根据配置文件中的config.getDataLogDir(),config.getDataDir()来初始化的。这两个分别为事务日志和快照数据的目录
+public ZKDatabase(FileTxnSnapLog snapLog) {
+    
+    // 初始化ZK的数据结构(树形)
+    dataTree = new DataTree();
+    sessionsWithTimeouts = new ConcurrentHashMap<Long, Integer>();
+    this.snapLog = snapLog;
+
+    try {
+        snapshotSizeFactor = Double.parseDouble(
+            System.getProperty(SNAPSHOT_SIZE_FACTOR,
+                    Double.toString(DEFAULT_SNAPSHOT_SIZE_FACTOR)));
+        if (snapshotSizeFactor > 1) {
+            snapshotSizeFactor = DEFAULT_SNAPSHOT_SIZE_FACTOR;
+            LOG.warn("The configured {} is invalid, going to use " +
+                    "the default {}", SNAPSHOT_SIZE_FACTOR,
+                    DEFAULT_SNAPSHOT_SIZE_FACTOR);
+        }
+    } catch (NumberFormatException e) {
+        LOG.error("Error parsing {}, using default value {}",
+                SNAPSHOT_SIZE_FACTOR, DEFAULT_SNAPSHOT_SIZE_FACTOR);
+        snapshotSizeFactor = DEFAULT_SNAPSHOT_SIZE_FACTOR;
+    }
+    LOG.info("{} = {}", SNAPSHOT_SIZE_FACTOR, snapshotSizeFactor);
+}
+```
+
+
+

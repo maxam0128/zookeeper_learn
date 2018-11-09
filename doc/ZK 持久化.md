@@ -2,11 +2,16 @@
 
 ZK 中需要持久化的有两种数据结构：事务日志和快照数据。
 
-> TxnLog ： 事务日志操作接口
-> SnapShot : 数据快照操作接口
+> TxnLog ： 事务日志读取接口
+> SnapShot : 快照数据持久化接口
 
-## FileTxnLog 事务日志操作实现
+## FileTxnLog 
+
+这个类主要是实现了事务日志操作接口-TxnLog。下面我们首先看下这个类的主要成员。
 
 
 
-## FileSnap 数据快照操作实现
+
+
+
+## FileSnap 快照数据持久化接口
