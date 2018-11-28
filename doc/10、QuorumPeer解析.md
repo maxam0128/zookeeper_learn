@@ -1,5 +1,9 @@
 # QuorumPeer
 
+参考：
+1、https://blog.reactor.top/2018/04/09/zookeeper%E6%BA%90%E7%A0%81-ZAB%E5%8D%8F%E8%AE%AE%E4%B9%8B%E9%9B%86%E7%BE%A4%E5%90%8C%E6%AD%A5_3/
+2、http://iwinit.iteye.com/blog/1775439
+
 这个类主要管理提议者协议的，它在服务器内部有三种状态：
 
 > Leader election: 选举阶段(初始化的时候提议自己为Leader)
@@ -505,7 +509,7 @@ protected void syncWithLeader(long newLeaderZxid) throws Exception{
 
 > Leader.DIFF Follower只从Leader同步增量数据
 >
->Leader.TRUNC Follower 截断 logs
+>Leader.TRUNC Follower 的zxid比Leader大，这时候Follower 回滚Leader zxid 后面的数据
 >
 >Leader.SNAP Follower 从Leader download snapshot 数据
 >
@@ -600,14 +604,15 @@ try {
     // 创建leader 
     setLeader(makeLeader(logFactory));
     
-    // 
+    //
     leader.lead();
     setLeader(null);
 } catch (Exception e) {
 
-    // 
     LOG.warn("Unexpected exception",e);
 } finally {
+
+    // 如果leader 出现异常，则强制关闭leader
     if (leader != null) {
         leader.shutdown("Forcing shutdown");
         setLeader(null);
@@ -620,6 +625,10 @@ try {
 
 ```text
 
+// 1、
+// 2、
+// 启动 LeaderZooKeeperServer， startZkServer,
+// 启动管理服务
 
 void lead() throws IOException, InterruptedException {
     self.end_fle = Time.currentElapsedTime();
@@ -634,12 +643,16 @@ void lead() throws IOException, InterruptedException {
 
     try {
         self.tick.set(0);
+        
+        // 1、理论上不会再次加载数据(在选举前已经加载过数据)，通过QuorumPeer#getLastLoggedZxid 来获取zxid作为初次的投票信息
+        // 2、删除过期的session
+        // 3、将当前的数据保存一次snapshot
         zk.loadData();
 
         leaderStateSummary = new StateSummary(self.getCurrentEpoch(), zk.getLastProcessedZxid());
 
-        // Start thread that waits for connection requests from
-        // new followers.
+        // 开启新的线程等待 follower 的连接请求
+        // 这里详情参考LearHandler 
         cnxAcceptor = new LearnerCnxAcceptor();
         cnxAcceptor.start();
 
@@ -659,8 +672,11 @@ void lead() throws IOException, InterruptedException {
             LOG.info("NEWLEADER proposal has Zxid of "
                     + Long.toHexString(newLeaderProposal.packet.getZxid()));
         }
-
+    
+        // 最后的提案配置
         QuorumVerifier lastSeenQV = self.getLastSeenQuorumVerifier();
+        
+        // 最后的提交配置
         QuorumVerifier curQV = self.getQuorumVerifier();
         if (curQV.getVersion() == 0 && curQV.getVersion() == lastSeenQV.getVersion()) {
             // This was added in ZOOKEEPER-1783. The initial config has version 0 (not explicitly
