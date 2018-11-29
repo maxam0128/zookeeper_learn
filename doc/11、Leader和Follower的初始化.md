@@ -354,7 +354,12 @@ public boolean syncFollower(long peerLastZxid, ZKDatabase db, Leader leader) {
          *    txnlog + committedLog to sync with follower. If that fail,
          *    we will send snapshot
          */
-
+        // 处理的5种方式
+        // 1、强制发送snapshot(测试目的)
+        // 2、follower 和 leader 已经同步，则发送空的 diff 消息
+        // 3、follower 的 txn 比leader 要多，那么则发送 TRUNC ，回滚follower多余的 txn数据。
+        // 4、follower 在committedLog同步的范围内，那么根据follower 的zxid来决定发送 TRUNC 还是DIFF,如果follower 在同步中的话就发送 空的DIFF
+        // 5、follower 丢失了committedLog。会将leader 磁盘上的txnLog和committedLog同步给follower，如果失败了，会发送snapshot
         
         // 是否强制同步snapshot
         if (forceSnapSync) {
@@ -391,23 +396,35 @@ public boolean syncFollower(long peerLastZxid, ZKDatabase db, Leader leader) {
             Iterator<Proposal> itr = db.getCommittedLog().iterator();
             currentZxid = queueCommittedProposals(itr, peerLastZxid,
                                                  null, maxCommittedLog);
+            
+            // 不需要同步整个snapshot 
             needSnap = false;
         } else if (peerLastZxid < minCommittedLog && txnLogSyncEnabled) {
+            // 如果follower 最大的zxid 小于 leader 最小 minCommittedLog，并且允许从txnLog中同步数据
+            
             // Use txnlog and committedLog to sync
             
             // Calculate sizeLimit that we allow to retrieve txnlog from disk
+            // 计算事务日志的大小(允许我们从磁盘中恢复的事务日志大小)
             long sizeLimit = db.calculateTxnLogSizeLimit();
             // This method can return empty iterator if the requested zxid
             // is older than on-disk txnlog
+            // 如果 zxid > txnlogId 返回空
             Iterator<Proposal> txnLogItr = db.getProposalsFromTxnLog(
                     peerLastZxid, sizeLimit);
             if (txnLogItr.hasNext()) {
                 LOG.info("Use txnlog and committedLog for peer sid: " +  getSid());
+                
+                // 首先从txnlog 中恢复数据
                 currentZxid = queueCommittedProposals(txnLogItr, peerLastZxid,
                                                      minCommittedLog, maxCommittedLog);
 
                 LOG.debug("Queueing committedLog 0x" + Long.toHexString(currentZxid));
+                
+                // 再从committedLog中恢复数据
                 Iterator<Proposal> committedLogItr = db.getCommittedLog().iterator();
+                
+                
                 currentZxid = queueCommittedProposals(committedLogItr, currentZxid,
                                                      null, maxCommittedLog);
                 needSnap = false;
@@ -422,11 +439,14 @@ public boolean syncFollower(long peerLastZxid, ZKDatabase db, Leader leader) {
         }
         LOG.debug("Start forwarding 0x" + Long.toHexString(currentZxid) +
                   " for peer sid: " +  getSid());
+        
+        // follower 开始同步数据
         leaderLastZxid = leader.startForwarding(this, currentZxid);
     } finally {
         rl.unlock();
     }
 
+    // committedLog 丢失(即follower的 zxid 小于磁盘上txnLogId )，同步snapshot
     if (needOpPacket && !needSnap) {
         // This should never happen, but we should fall back to sending
         // snapshot just in case.
@@ -438,6 +458,120 @@ public boolean syncFollower(long peerLastZxid, ZKDatabase db, Leader leader) {
     return needSnap;
 }
 ```
+
+发送同步数据包到对应的follower
+```
+if (getVersion() < 0x10000) {
+    QuorumPacket newLeaderQP = new QuorumPacket(Leader.NEWLEADER,
+            newLeaderZxid, null, null);
+    oa.writeRecord(newLeaderQP, "packet");
+} else {
+    
+    // 版本信息默认为 0x10000 ，添加 Leader.NEWLEADER 数据包到queuedPackets
+    QuorumPacket newLeaderQP = new QuorumPacket(Leader.NEWLEADER,
+            newLeaderZxid, leader.self.getLastSeenQuorumVerifier()
+                    .toString().getBytes(), null);
+    queuedPackets.add(newLeaderQP);
+}
+bufferedOutput.flush();
+
+
+/* if we are not truncating or sending a diff just send a snapshot */
+// 同步snapshot 
+if (needSnap) {
+    boolean exemptFromThrottle = getLearnerType() != LearnerType.OBSERVER;
+    
+    // 构建一个snapshot
+    LearnerSnapshot snapshot = 
+            leader.getLearnerSnapshotThrottler().beginSnapshot(exemptFromThrottle);
+    try {
+        long zxidToSend = leader.zk.getZKDatabase().getDataTreeLastProcessedZxid();
+        
+        // 发送Leader.SNAP 数据包给follower ，代表接下来要同步snapshot
+        oa.writeRecord(new QuorumPacket(Leader.SNAP, zxidToSend, null, null), "packet");
+        bufferedOutput.flush();
+
+        LOG.info("Sending snapshot last zxid of peer is 0x{}, zxid of leader is 0x{}, "
+                + "send zxid of db as 0x{}, {} concurrent snapshots, " 
+                + "snapshot was {} from throttle",
+                Long.toHexString(peerLastZxid), 
+                Long.toHexString(leaderLastZxid),
+                Long.toHexString(zxidToSend), 
+                snapshot.getConcurrentSnapshotNumber(),
+                snapshot.isEssential() ? "exempt" : "not exempt");
+        // Dump data to peer
+        leader.zk.getZKDatabase().serializeSnapshot(oa);
+        oa.writeString("BenWasHere", "signature");
+        bufferedOutput.flush();
+    } finally {
+        snapshot.close();
+    }
+}
+
+```
+
+开启线程进行同步数据
+
+```$xslt
+
+
+// Start thread that blast packets in the queue to learner
+startSendingPackets();
+
+// 可以看出startSendingPackets 就是开启了一个线程，然后调用 sendPackets 来发送 queuedPackets 队列中的数据包
+
+private void sendPackets() throws InterruptedException {
+    long traceMask = ZooTrace.SERVER_PACKET_TRACE_MASK;
+    while (true) {
+        try {
+            QuorumPacket p;
+            
+            // 从发送队列中取出要发送的数据包
+            p = queuedPackets.poll();
+            if (p == null) {
+                bufferedOutput.flush();
+                
+                // 如果为空，则阻塞
+                p = queuedPackets.take();
+            }
+            
+            if (p == proposalOfDeath) {
+                // Packet of death!
+                break;
+            }
+            if (p.getType() == Leader.PING) {
+                traceMask = ZooTrace.SERVER_PING_TRACE_MASK;
+            }
+            if (p.getType() == Leader.PROPOSAL) {
+                syncLimitCheck.updateProposal(p.getZxid(), System.nanoTime());
+            }
+            if (LOG.isTraceEnabled()) {
+                ZooTrace.logQuorumPacket(LOG, traceMask, 'o', p);
+            }
+            
+            // 发送数据给follower
+            oa.writeRecord(p, "packet");
+        } catch (IOException e) {
+            if (!sock.isClosed()) {
+                LOG.warn("Unexpected exception at " + this, e);
+                try {
+                    // this will cause everything to shutdown on
+                    // this learner handler and will help notify
+                    // the learner/observer instantaneously
+                    sock.close();
+                } catch(IOException ie) {
+                    LOG.warn("Error closing socket for handler " + this, ie);
+                }
+            }
+            break;
+        }
+    }
+}
+
+```
+
+
+
 
 
 
@@ -499,7 +633,7 @@ public long getEpochToPropose(long sid, long lastAcceptedEpoch) throws Interrupt
 
 ## Follower 初始化
 
-Follower的继承关系：Follower -》 Learner
+Follower的继承关系：Follower -> Learner
 
 ```
 case FOLLOWING:
@@ -667,4 +801,280 @@ protected long registerWithLeader(int pktType) throws IOException{
 ```
 
 ### 同步 Leader 数据
+
+```
+
+protected void syncWithLeader(long newLeaderZxid) throws Exception{
+    
+    // 构造ACK消息报
+    QuorumPacket ack = new QuorumPacket(Leader.ACK, 0, null, null);
+    QuorumPacket qp = new QuorumPacket();
+    long newEpoch = ZxidUtils.getEpochFromZxid(newLeaderZxid);
+    
+    QuorumVerifier newLeaderQV = null;
+    
+    // In the DIFF case we don't need to do a snapshot because the transactions will sync on top of any existing snapshot
+    // For SNAP and TRUNC the snapshot is needed to save that history
+    // 增量模式下，不需要同步snapshot。
+    boolean snapshotNeeded = true;
+    
+    // 读取leader 数据
+    readPacket(qp);
+    LinkedList<Long> packetsCommitted = new LinkedList<Long>();
+    LinkedList<PacketInFlight> packetsNotCommitted = new LinkedList<PacketInFlight>();
+    
+    // 根据leader 反馈的同步数据方式进行数据同步，
+    synchronized (zk) {
+        
+        // DIFF 当前follower 和leader 数据相同
+        if (qp.getType() == Leader.DIFF) {
+            LOG.info("Getting a diff from the leader 0x{}", Long.toHexString(qp.getZxid()));
+            snapshotNeeded = false;
+        }
+        else if (qp.getType() == Leader.SNAP) {
+            LOG.info("Getting a snapshot from leader 0x" + Long.toHexString(qp.getZxid()));
+            // The leader is going to dump the database
+            // db is clear as part of deserializeSnapshot()
+            
+            // 首先会清空当前节点的数据库，然后用leader的数据初始化新的dataTree
+            zk.getZKDatabase().deserializeSnapshot(leaderIs);
+            // ZOOKEEPER-2819: overwrite config node content extracted
+            // from leader snapshot with local config, to avoid potential
+            // inconsistency of config node content during rolling restart.
+            if (!QuorumPeerConfig.isReconfigEnabled()) {
+                LOG.debug("Reset config node content from local config after deserialization of snapshot.");
+                zk.getZKDatabase().initConfigInZKDatabase(self.getQuorumVerifier());
+            }
+            String signature = leaderIs.readString("signature");
+            if (!signature.equals("BenWasHere")) {
+                LOG.error("Missing signature. Got " + signature);
+                throw new IOException("Missing signature");                   
+            }
+            zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
+        } else if (qp.getType() == Leader.TRUNC) {
+            //we need to truncate the log to the lastzxid of the leader
+            LOG.warn("Truncating log to get in sync with the leader 0x"
+                    + Long.toHexString(qp.getZxid()));
+                    
+            // 将follower的数据回滚到 leader#maxCommittedLog 
+            boolean truncated=zk.getZKDatabase().truncateLog(qp.getZxid());
+            if (!truncated) {
+                // not able to truncate the log
+                LOG.error("Not able to truncate the log "
+                        + Long.toHexString(qp.getZxid()));
+                System.exit(13);
+            }
+            zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
+
+        }
+        else {
+            LOG.error("Got unexpected packet from leader: {}, exiting ... ",
+                      LearnerHandler.packetToString(qp));
+            System.exit(13);
+
+        }
+        zk.getZKDatabase().initConfigInZKDatabase(self.getQuorumVerifier());
+        
+        // 创建session 过期检查线程
+        zk.createSessionTracker();            
+        
+        long lastQueued = 0;
+
+        // 在Zab V1.0 (ZK 3.4+)版本中，follower收到 NEWLEADER 消息后会做一次 snapshot，但是在V1.0以前，在收到UPDATE消息后也会做snapshot。
+        // 但是在 V1.0 中，在 收到 NEWLEADER消息后还会再次收到 UPDATE的消息，这个标志位就是确保在V1.0版本不会做两次snapshot。
+        boolean isPreZAB1_0 = true;
+        
+        // 如果没有从leader 同步 snapshot，确保事务不会只存在内存中，而是要写到 transaction log
+        boolean writeToTxnLog = !snapshotNeeded;
+        // we are now going to start getting transactions to apply followed by an UPTODATE
+        
+        // 
+        outerLoop:
+        while (self.isRunning()) {
+            readPacket(qp);
+            switch(qp.getType()) {
+            case Leader.PROPOSAL:
+                PacketInFlight pif = new PacketInFlight();
+                pif.hdr = new TxnHeader();
+                pif.rec = SerializeUtils.deserializeTxn(qp.getData(), pif.hdr);
+                if (pif.hdr.getZxid() != lastQueued + 1) {
+                LOG.warn("Got zxid 0x"
+                        + Long.toHexString(pif.hdr.getZxid())
+                        + " expected 0x"
+                        + Long.toHexString(lastQueued + 1));
+                }
+                lastQueued = pif.hdr.getZxid();
+                
+                if (pif.hdr.getType() == OpCode.reconfig){                
+                    SetDataTxn setDataTxn = (SetDataTxn) pif.rec;       
+                   QuorumVerifier qv = self.configFromString(new String(setDataTxn.getData()));
+                   self.setLastSeenQuorumVerifier(qv, true);                               
+                }
+                
+                // 添加 PROPOSAL 消息 到 packetsNotCommitted 队列
+                packetsNotCommitted.add(pif);
+                break;
+            case Leader.COMMIT:
+            case Leader.COMMITANDACTIVATE:
+                
+                // 取出第一条 PROPOSAL 消息，目的是按顺序提交消息 
+                // 发送消息顺序 p1,p2,p3,c1,p4,c2,c3,c4 ... 提交也是按照p1,p2,p3,p4 这个顺序提交
+                pif = packetsNotCommitted.peekFirst();
+                // Leader 发送的提交消息
+                if (pif.hdr.getZxid() == qp.getZxid() && qp.getType() == Leader.COMMITANDACTIVATE) {
+                    
+                    // 处理配置信息
+                    QuorumVerifier qv = self.configFromString(new String(((SetDataTxn) pif.rec).getData()));
+                    boolean majorChange = self.processReconfig(qv, ByteBuffer.wrap(qp.getData()).getLong(),
+                            qp.getZxid(), true);
+                    if (majorChange) {
+                        throw new Exception("changes proposed in reconfig");
+                    }
+                }
+                
+                // 是否写 transaction log
+                if (!writeToTxnLog) {
+                    if (pif.hdr.getZxid() != qp.getZxid()) {
+                        LOG.warn("Committing " + qp.getZxid() + ", but next proposal is " + pif.hdr.getZxid());
+                    } else {
+                        
+                        // 写日志
+                        zk.processTxn(pif.hdr, pif.rec);
+                        // 写完日志后将数据包从 packetsNotCommitted 移出
+                        packetsNotCommitted.remove();
+                    }
+                } else {
+                    // 
+                    packetsCommitted.add(qp.getZxid());
+                }
+                break;
+            case Leader.INFORM:
+            case Leader.INFORMANDACTIVATE:
+                PacketInFlight packet = new PacketInFlight();
+                packet.hdr = new TxnHeader();
+
+                if (qp.getType() == Leader.INFORMANDACTIVATE) {
+                    ByteBuffer buffer = ByteBuffer.wrap(qp.getData());
+                    long suggestedLeaderId = buffer.getLong();
+                    byte[] remainingdata = new byte[buffer.remaining()];
+                    buffer.get(remainingdata);
+                    packet.rec = SerializeUtils.deserializeTxn(remainingdata, packet.hdr);
+                    QuorumVerifier qv = self.configFromString(new String(((SetDataTxn)packet.rec).getData()));
+                    boolean majorChange =
+                            self.processReconfig(qv, suggestedLeaderId, qp.getZxid(), true);
+                    if (majorChange) {
+                        throw new Exception("changes proposed in reconfig");
+                    }
+                } else {
+                    packet.rec = SerializeUtils.deserializeTxn(qp.getData(), packet.hdr);
+                    // Log warning message if txn comes out-of-order
+                    if (packet.hdr.getZxid() != lastQueued + 1) {
+                        LOG.warn("Got zxid 0x"
+                                + Long.toHexString(packet.hdr.getZxid())
+                                + " expected 0x"
+                                + Long.toHexString(lastQueued + 1));
+                    }
+                    lastQueued = packet.hdr.getZxid();
+                }
+                if (!writeToTxnLog) {
+                    // Apply to db directly if we haven't taken the snapshot
+                    zk.processTxn(packet.hdr, packet.rec);
+                } else {
+                    packetsNotCommitted.add(packet);
+                    packetsCommitted.add(qp.getZxid());
+                }
+
+                break;                
+            case Leader.UPTODATE:
+                LOG.info("Learner received UPTODATE message");                                      
+                if (newLeaderQV!=null) {
+                   boolean majorChange =
+                       self.processReconfig(newLeaderQV, null, null, true);
+                   if (majorChange) {
+                       throw new Exception("changes proposed in reconfig");
+                   }
+                }
+                if (isPreZAB1_0) {
+                    zk.takeSnapshot();
+                    self.setCurrentEpoch(newEpoch);
+                }
+                self.setZooKeeperServer(zk);
+                self.adminServer.setZooKeeperServer(zk);
+                break outerLoop;
+            case Leader.NEWLEADER: // Getting NEWLEADER here instead of in discovery 
+                // means this is Zab 1.0
+               LOG.info("Learner received NEWLEADER message");
+               if (qp.getData()!=null && qp.getData().length > 1) {
+                   try {                       
+                       QuorumVerifier qv = self.configFromString(new String(qp.getData()));
+                       self.setLastSeenQuorumVerifier(qv, true);
+                       newLeaderQV = qv;
+                   } catch (Exception e) {
+                       e.printStackTrace();
+                   }
+               }
+
+               if (snapshotNeeded) {
+                   zk.takeSnapshot();
+               }
+               
+                self.setCurrentEpoch(newEpoch);
+                writeToTxnLog = true; //Anything after this needs to go to the transaction log, not applied directly in memory
+                isPreZAB1_0 = false;
+                
+                // 如果leader 发送Leader.NEWLEADER数据包，则回复ACK
+                writePacket(new QuorumPacket(Leader.ACK, newLeaderZxid, null, null), true);
+                break;
+            }
+        }
+    }
+    ack.setZxid(ZxidUtils.makeZxid(newEpoch, 0));
+    writePacket(ack, true);
+    sock.setSoTimeout(self.tickTime * self.syncLimit);
+    zk.startup();
+    /*
+     * Update the election vote here to ensure that all members of the
+     * ensemble report the same vote to new servers that start up and
+     * send leader election notifications to the ensemble.
+     * 
+     * @see https://issues.apache.org/jira/browse/ZOOKEEPER-1732
+     */
+    self.updateElectionVote(newEpoch);
+
+    // We need to log the stuff that came in between the snapshot and the uptodate
+    if (zk instanceof FollowerZooKeeperServer) {
+        FollowerZooKeeperServer fzk = (FollowerZooKeeperServer)zk;
+        for(PacketInFlight p: packetsNotCommitted) {
+            fzk.logRequest(p.hdr, p.rec);
+        }
+        for(Long zxid: packetsCommitted) {
+            fzk.commit(zxid);
+        }
+    } else if (zk instanceof ObserverZooKeeperServer) {
+        // Similar to follower, we need to log requests between the snapshot
+        // and UPTODATE
+        ObserverZooKeeperServer ozk = (ObserverZooKeeperServer) zk;
+        for (PacketInFlight p : packetsNotCommitted) {
+            Long zxid = packetsCommitted.peekFirst();
+            if (p.hdr.getZxid() != zxid) {
+                // log warning message if there is no matching commit
+                // old leader send outstanding proposal to observer
+                LOG.warn("Committing " + Long.toHexString(zxid)
+                        + ", but next proposal is "
+                        + Long.toHexString(p.hdr.getZxid()));
+                continue;
+            }
+            packetsCommitted.remove();
+            Request request = new Request(null, p.hdr.getClientId(),
+                    p.hdr.getCxid(), p.hdr.getType(), null, null);
+            request.setTxn(p.rec);
+            request.setHdr(p.hdr);
+            ozk.commitRequest(request);
+        }
+    } else {
+        // New server type need to handle in-flight packets
+        throw new UnsupportedOperationException("Unknown server type");
+    }
+}
+```
 
