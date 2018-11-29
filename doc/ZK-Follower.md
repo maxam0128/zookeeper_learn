@@ -133,60 +133,104 @@ protected void connectToLeader(InetSocketAddress addr, String hostname)
 
 这个主要是通过Learner#registerWithLeader 实现。通过Learner实现 follower 和 observer 的代码复用。这个方法主要有以下功能：
 
-- 1、follower 会将自身的zxid
+- 1、follower 会将自身的信息发送给leader
+- 2、从leader 返回的消息解析出最新的选举轮次-newEpoch
+- 3、将自身的lastLoggedZxid消息封装成ACK消息包回传给leader
+
+下面我们分别看这三点的实现。
+
+#### 2.1、发送自身信息
+
+follower 会将自身的信息封装成FOLLOWERINFO数据包，然后发送给leader，代码如下：
 
 ```
-protected long registerWithLeader(int pktType) throws IOException{
+long lastLoggedZxid = self.getLastLoggedZxid();
+QuorumPacket qp = new QuorumPacket();
 
-    long lastLoggedZxid = self.getLastLoggedZxid();
-    QuorumPacket qp = new QuorumPacket();                
-    qp.setType(pktType);
-    qp.setZxid(ZxidUtils.makeZxid(self.getAcceptedEpoch(), 0));
-    
-    /*
-     * Add sid to payload
-     */
-    LearnerInfo li = new LearnerInfo(self.getId(), 0x10000, self.getQuorumVerifier().getVersion());
-    ByteArrayOutputStream bsid = new ByteArrayOutputStream();
-    BinaryOutputArchive boa = BinaryOutputArchive.getArchive(bsid);
-    boa.writeRecord(li, "LearnerInfo");
-    qp.setData(bsid.toByteArray());
-    
-    writePacket(qp, true);
-    readPacket(qp);        
-    final long newEpoch = ZxidUtils.getEpochFromZxid(qp.getZxid());
-    if (qp.getType() == Leader.LEADERINFO) {
-        // we are connected to a 1.0 server so accept the new epoch and read the next packet
-        leaderProtocolVersion = ByteBuffer.wrap(qp.getData()).getInt();
-        byte epochBytes[] = new byte[4];
-        final ByteBuffer wrappedEpochBytes = ByteBuffer.wrap(epochBytes);
-        if (newEpoch > self.getAcceptedEpoch()) {
-            wrappedEpochBytes.putInt((int)self.getCurrentEpoch());
-            self.setAcceptedEpoch(newEpoch);
-        } else if (newEpoch == self.getAcceptedEpoch()) {
-            // since we have already acked an epoch equal to the leaders, we cannot ack
-            // again, but we still need to send our lastZxid to the leader so that we can
-            // sync with it if it does assume leadership of the epoch.
-            // the -1 indicates that this reply should not count as an ack for the new epoch
-            wrappedEpochBytes.putInt(-1);
-        } else {
-            throw new IOException("Leaders epoch, " + newEpoch + " is less than accepted epoch, " + self.getAcceptedEpoch());
-        }
-        QuorumPacket ackNewEpoch = new QuorumPacket(Leader.ACKEPOCH, lastLoggedZxid, epochBytes, null);
-        writePacket(ackNewEpoch, true);
-        return ZxidUtils.makeZxid(newEpoch, 0);
-    } else {
-        if (newEpoch > self.getAcceptedEpoch()) {
-            self.setAcceptedEpoch(newEpoch);
-        }
-        if (qp.getType() != Leader.NEWLEADER) {
-            LOG.error("First packet should have been NEWLEADER");
-            throw new IOException("First packet should have been NEWLEADER");
-        }
-        return qp.getZxid();
-    }
-} 
+// pktType 为 Leader.FOLLOWERINFO                
+qp.setType(pktType);
+
+// follower接受的选举轮次
+qp.setZxid(ZxidUtils.makeZxid(self.getAcceptedEpoch(), 0));
+
+构造 QuorumPacket 中的data数据，包含follower的sid，protocolVersion，configVersion
+LearnerInfo li = new LearnerInfo(self.getId(), 0x10000, self.getQuorumVerifier().getVersion());
+ByteArrayOutputStream bsid = new ByteArrayOutputStream();
+BinaryOutputArchive boa = BinaryOutputArchive.getArchive(bsid);
+boa.writeRecord(li, "LearnerInfo");
+qp.setData(bsid.toByteArray());
+
+// 发送数据
+writePacket(qp, true);
 ```
+
+#### 2.2、解析leader返回的数据
+
+```
+
+// 从leader 的回传数据解析出最新的选举轮次 epoch ，
+// 这个时候leader 一定是接受到了大多数的 Follower 连接，并对每个 follower的epoch进行了处理，计算出最新的epoch        
+final long newEpoch = ZxidUtils.getEpochFromZxid(qp.getZxid());
+
+```
+
+#### 2.3、封装lastLoggedZxid，返回ACK给leader
+
+leader在收到大多数follower发送的 FOLLOWERINFO 请求后，会确定一个最新的选举轮次，并将自身的信息封装成Leader.LEADERINFO数据包回传给每个follower。代码如下：
+
+```
+leaderProtocolVersion = ByteBuffer.wrap(qp.getData()).getInt();
+byte epochBytes[] = new byte[4];
+final ByteBuffer wrappedEpochBytes = ByteBuffer.wrap(epochBytes);
+   .....
+
+// 将follower的lastLoggedZxid封装成一个ACK消息包回传给leader，
+// leader 在收到ack消息后会使用follower 回传的 lastLoggedZxid 来确认此follower向leader同步数据的方式，例如Leader.SNAP、DIFF、TRUNC
+QuorumPacket ackNewEpoch = new QuorumPacket(Leader.ACKEPOCH, lastLoggedZxid, epochBytes, null);
+writePacket(ackNewEpoch, true);
+
+// 用最新的选举轮次生成zxid
+return ZxidUtils.makeZxid(newEpoch, 0);
+```
+
+### 3、向leader同步数据
+
+一个节点成为follower之后，为了保证集群之间的数据一致，所以在对外服务之前要先向leader同步数据，同步的方式是根据当前follower的zxid和leader的zxid相比较而来。具体如下：
+
+- 1、leader 首先会获取自身的minCommittedLog和 maxCommittedLog
+- 2、如果 follower#lastLoggedZxid == leader#maxCommittedLog ，则发送Leader.DIFF，表示此follower和leader之间数据相同，不需要同步
+- 3、如果 follower#lastLoggedZxid > leader#maxCommittedLog，则发送Leader.TRUNC和maxCommittedLog，让follower将自身数据回滚到maxCommittedLog
+- 4、如果 follower#lastLoggedZxid >= leader#minCommittedLog && follower#lastLoggedZxid <= leader#maxCommittedLog，follower增量同步leader的数据
+- 5、如果 follower#lastLoggedZxid < leader#minCommittedLog，则需要同步leader的snapshot
+
+上面几个点只是大概的说明了follower 从leader同步数据的方式，这里为了简化忽略了某些条件，具体的方式可以参考LearnerHandler#syncFollower。下面我们继续看这个同步数据方法。
+
+#### 3.1、同步snapshot
+
+```
+// 首先会清空当前节点的数据库，然后用leader的数据初始化新的dataTree
+zk.getZKDatabase().deserializeSnapshot(leaderIs);
+
+// 设置最终处理的 zxid 为Leader的zxid
+zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
+```
+
+#### 3.2、follower回滚
+
+```
+// 调用ZKDatabase
+boolean truncated=zk.getZKDatabase().truncateLog(qp.getZxid());
+if (!truncated) {
+    // not able to truncate the log
+    LOG.error("Not able to truncate the log "
+            + Long.toHexString(qp.getZxid()));
+    System.exit(13);
+}
+zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
+```
+
+
+
 
 
 
