@@ -201,33 +201,67 @@ return ZxidUtils.makeZxid(newEpoch, 0);
 - 2、如果 follower#lastLoggedZxid == leader#maxCommittedLog ，则发送Leader.DIFF，表示此follower和leader之间数据相同，不需要同步
 - 3、如果 follower#lastLoggedZxid > leader#maxCommittedLog，则发送Leader.TRUNC和maxCommittedLog，让follower将自身数据回滚到maxCommittedLog
 - 4、如果 follower#lastLoggedZxid >= leader#minCommittedLog && follower#lastLoggedZxid <= leader#maxCommittedLog，follower增量同步leader的数据
-- 5、如果 follower#lastLoggedZxid < leader#minCommittedLog，则需要同步leader的snapshot
+- 5、如果 follower#lastLoggedZxid < leader#minCommittedLog，优先会从txnLog同步数据，如果txnLog为空才会同步leader的snapshot
 
 上面几个点只是大概的说明了follower 从leader同步数据的方式，这里为了简化忽略了某些条件，具体的方式可以参考LearnerHandler#syncFollower。下面我们继续看这个同步数据方法。
 
 #### 3.1、同步snapshot
 
-```
-// 首先会清空当前节点的数据库，然后用leader的数据初始化新的dataTree
-zk.getZKDatabase().deserializeSnapshot(leaderIs);
+在snapshot模式下，follower和leader之间数据交互方式为：
+- 1、leader 发送一个Leader.SNAP给follower
+- 2、follower 收到Leader.SNAP数据包后，首先会将自己的数据清空，然后将leader发送的snapshot数据还原出新的database
+- 3、设置lastProcessedZxid
 
-// 设置最终处理的 zxid 为Leader的zxid
-zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
+核心代码如下：
+
+```
+else if (qp.getType() == Leader.SNAP) {
+    // 首先会清空当前节点的数据库，然后用leader的数据初始化新的dataTree
+    zk.getZKDatabase().deserializeSnapshot(leaderIs);
+    
+    // 设置最终处理的 zxid 为Leader的zxid
+    zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
+}
 ```
 
 #### 3.2、follower回滚
 
+在Leader.TRUNC模式下leader和follower的数据交互如下：
+- 1、leader 发送Leader.TRUNC数据包给follower，同时也发送了自己的maxCommittedLog
+- 2、follower 收到消息后回滚到leader的maxCommittedLog节点
+- 3、设置lastProcessedZxid
+
+核心代码如下：
+
 ```
-// 调用ZKDatabase
-boolean truncated=zk.getZKDatabase().truncateLog(qp.getZxid());
-if (!truncated) {
-    // not able to truncate the log
-    LOG.error("Not able to truncate the log "
-            + Long.toHexString(qp.getZxid()));
-    System.exit(13);
+else if (qp.getType() == Leader.TRUNC) {
+    // 调用ZKDatabase
+    boolean truncated=zk.getZKDatabase().truncateLog(qp.getZxid());
+    if (!truncated) {
+        // not able to truncate the log
+        LOG.error("Not able to truncate the log "
+                + Long.toHexString(qp.getZxid()));
+        System.exit(13);
+    }
+    zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
 }
-zk.getZKDatabase().setlastProcessedZxid(qp.getZxid());
 ```
+
+#### 3.3、增量同步
+
+在Leader.DIFF场景下，会follower会同步它和leader之间的差异数据(即follower#lastLoggedZxid >= leader#minCommittedLog && follower#lastLoggedZxid <= leader#maxCommittedLog)，它们之间的数据交互方式为：
+
+1、leader发送Leader.DIFF数据包给follower
+2、接着leader会发送follower#lastLoggedZxid到leader#maxCommittedLog之间的propose.packet,每个propose.packet之后都会紧接着发送一个Leader.COMMIT和packetZxid(packte对应的zxid)
+3、follower首先会收到Leader.DIFF类型的数据包，它先将snapshotNeeded(是否snapshot)设为false
+4、接着就是处理每个Leader.PROPOSAL和Leader.COMMIT包
+5、leader发送完数据之后接着会发送Leader.NEWLEADER，然后它会阻塞等待大多数follower回传的Leader.ACK数据包
+6、follower处理到Leader.NEWLEADER这个数据包时，说明它已经将leader的差异数据处理完成了，然后它会给leader回发一个Leader.ACK消息
+7、leader在收到大多数follower回传的的Leader.ACK消息之后，接着会发送Leader.UPTODATE给follower
+8、follower收到Leader.UPTODATE消息后设置ServerCnxnFactory的LearnerZooKeeperServer，然后跳出同步数据的循环
+
+详细代码如下：
+
 
 
 
