@@ -1,5 +1,5 @@
 
-# Follower
+# Follower 初始化
 
 zk在选举完成后，如果当前节点成为follower角色之后，它要做些什么？下面我们从源码的角度看看follower在选举完成后的主要工作。
 我们知道zk集群在选举阶段它的状态为：LOOKING，在这个状态下会通过Election#lookForLeader(默认为FastLeaderElection#lookForLeader)来进行选举，选出Leader之后会更新自身节点的角色状态。
@@ -251,27 +251,239 @@ else if (qp.getType() == Leader.TRUNC) {
 
 在Leader.DIFF场景下，会follower会同步它和leader之间的差异数据(即follower#lastLoggedZxid >= leader#minCommittedLog && follower#lastLoggedZxid <= leader#maxCommittedLog)，它们之间的数据交互方式为：
 
-1、leader发送Leader.DIFF数据包给follower
-2、接着leader会发送follower#lastLoggedZxid到leader#maxCommittedLog之间的propose.packet,每个propose.packet之后都会紧接着发送一个Leader.COMMIT和packetZxid(packte对应的zxid)
-3、follower首先会收到Leader.DIFF类型的数据包，它先将snapshotNeeded(是否snapshot)设为false
-4、接着就是处理每个Leader.PROPOSAL和Leader.COMMIT包
-5、leader发送完数据之后接着会发送Leader.NEWLEADER，然后它会阻塞等待大多数follower回传的Leader.ACK数据包
-6、follower处理到Leader.NEWLEADER这个数据包时，说明它已经将leader的差异数据处理完成了，然后它会给leader回发一个Leader.ACK消息
-7、leader在收到大多数follower回传的的Leader.ACK消息之后，接着会发送Leader.UPTODATE给follower
-8、follower收到Leader.UPTODATE消息后设置ServerCnxnFactory的LearnerZooKeeperServer，然后跳出同步数据的循环
+- 1、leader发送Leader.DIFF数据包给follower
+- 2、接着leader会发送follower#lastLoggedZxid到leader#maxCommittedLog之间的propose.packet,每个propose.packet之后都会紧接着发送一个Leader.COMMIT和packetZxid(packte对应的zxid)
+- 3、follower首先会收到Leader.DIFF类型的数据包，它先将snapshotNeeded(是否snapshot)设为false
+- 4、接着就是处理每个Leader.PROPOSAL和Leader.COMMIT包
+- 5、leader发送完数据之后接着会发送Leader.NEWLEADER，然后它会阻塞等待大多数follower回传的Leader.ACK数据包
+- 6、follower处理到Leader.NEWLEADER这个数据包时，说明它已经将leader的差异数据处理完成了，然后它会给leader回发一个Leader.ACK消息
+- 7、leader在收到大多数follower回传的的Leader.ACK消息之后，接着会发送Leader.UPTODATE给follower
+- 8、follower收到Leader.UPTODATE消息后设置ServerCnxnFactory的LearnerZooKeeperServer，然后跳出同步数据的循环
 
-详细代码如下：
+下面我们大概看下leader发送数据和follower同步数据的过程。
 
+1、leader发送增量数据
 
+下面的代码为Leader发送增量数据给follower的过程，其中去掉了日志代码
+```
+// itr = db.getCommittedLog().iterator(); leader已提交日志的迭代器
+// peerLastZxid = follower.lastLoggedZxid  follower 最后的提交记录
+// maxZxid = null
+// lastCommittedZxid = leader#maxCommittedLog leader 最大提交记录的zxid
 
+protected long queueCommittedProposals(Iterator<Proposal> itr,
+           long peerLastZxid, Long maxZxid, Long lastCommittedZxid) {
+    
+    // 是否新的选举周期，集群在初次启动时该值会为true(epoch、counter 都为0)        
+    boolean isPeerNewEpochZxid = (peerLastZxid & 0xffffffffL) == 0;
+    long queuedZxid = peerLastZxid;
 
+    // 前一个 Proposal 的zxid
+    long prevProposalZxid = -1;
+    while (itr.hasNext()) {
+        Proposal propose = itr.next();
 
+        long packetZxid = propose.packet.getZxid();
+        // abort if we hit the limit
+        // 如果达到maxid 则终止
+        if ((maxZxid != null) && (packetZxid > maxZxid)) {
+            break;
+        }
 
+        // 提过follower已提交的 Proposal
+        if (packetZxid < peerLastZxid) {
+            prevProposalZxid = packetZxid;
+            continue;
+        }
 
+        // 如果发送第一个包的时候，支出当前操作是要什么类型（这里为DIFF 或 TRUNC）
+        // 这个值初始为ture，在packetZxid >= peerLastZxid是第一次会进来
+        if (needOpPacket) {
 
+            // 如果follower 的 zxid 在 leader 的history中，则发送diff 包，
+            if (packetZxid == peerLastZxid) {
+                queueOpPacket(Leader.DIFF, lastCommittedZxid);
+                needOpPacket = false;
+                continue;
+            }
+            
+            if (isPeerNewEpochZxid) {
+               queueOpPacket(Leader.DIFF, lastCommittedZxid);
+               needOpPacket = false;
+            } else if (packetZxid > peerLastZxid  ) {
+                
+                
+                // follower 的选举周期和leader的选举周期不相等，说明当中这时leader已经发生了变化，这种场景下会同步snapshot
+                if (ZxidUtils.getEpochFromZxid(packetZxid) !=
+                        ZxidUtils.getEpochFromZxid(peerLastZxid)) {
+                    return queuedZxid;
+                }
+                
+                // 如果进入到这个条件，follower#lastLoggedZxid >= leader#minCommittedLog && follower#lastLoggedZxid <= leader#maxCommittedLog,
+                // 但是 follower#lastLoggedZxid 不在leader的事务 history中，这时需要发送一个Leader.TRUNC 包给follower，让follower回滚到prevProposalZxid
+                // 然后在通过diff 的方式同步数据
+                queueOpPacket(Leader.TRUNC, prevProposalZxid);
+                needOpPacket = false;
+            }
+        }
 
+        if (packetZxid <= queuedZxid) {
+            // We can get here, if we don't have op packet to queue
+            // or there is a duplicate txn in a given iterator
+            continue;
+        }
 
+        // 发送数据包
+        queuePacket(propose.packet);
+        // 发送commit 数据包，提交packetZxid 的数据
+        queueOpPacket(Leader.COMMIT, packetZxid);
+        queuedZxid = packetZxid;
 
+    }
 
+    if (needOpPacket && isPeerNewEpochZxid) {
+        // 初次发送空的diff包
+        queueOpPacket(Leader.DIFF, lastCommittedZxid);
+        needOpPacket = false;
+    }
+    
+    return queuedZxid;
+}  
+```
 
+2、follower同步同步数据的代码如下：
 
+```
+outerLoop:
+while (self.isRunning()) {
+    readPacket(qp);
+    switch(qp.getType()) {
+    case Leader.PROPOSAL:
+        PacketInFlight pif = new PacketInFlight();
+        pif.hdr = new TxnHeader();
+        pif.rec = SerializeUtils.deserializeTxn(qp.getData(), pif.hdr);
+        lastQueued = pif.hdr.getZxid();
+        
+        if (pif.hdr.getType() == OpCode.reconfig){                
+            SetDataTxn setDataTxn = (SetDataTxn) pif.rec;       
+           QuorumVerifier qv = self.configFromString(new String(setDataTxn.getData()));
+           self.setLastSeenQuorumVerifier(qv, true);                               
+        }
+        
+        // 将leader发送的proposal数据放到未提交列表中
+        packetsNotCommitted.add(pif);
+        break;
+    case Leader.COMMIT:
+    case Leader.COMMITANDACTIVATE:
+        // 提交信息，从leader的发送代码可知，一个Leader.PROPOSAL 数据包之后会紧跟一个Leader.COMMIT，
+        // 所以在收到commit的时候会按照顺序处理packetsNotCommitted队列中的数据
+        pif = packetsNotCommitted.peekFirst();
+        if (pif.hdr.getZxid() == qp.getZxid() && qp.getType() == Leader.COMMITANDACTIVATE) {
+            QuorumVerifier qv = self.configFromString(new String(((SetDataTxn) pif.rec).getData()));
+            boolean majorChange = self.processReconfig(qv, ByteBuffer.wrap(qp.getData()).getLong(),
+                    qp.getZxid(), true);
+            if (majorChange) {
+                throw new Exception("changes proposed in reconfig");
+            }
+        }
+        
+        // 因为这里是diff的方式同步，所以需要写事务日志的，所以执行else分支，将要提交的zxid放到packetsCommitted队列
+        if (!writeToTxnLog) {
+            if (pif.hdr.getZxid() != qp.getZxid()) {
+                LOG.warn("Committing " + qp.getZxid() + ", but next proposal is " + pif.hdr.getZxid());
+            } else {
+                zk.processTxn(pif.hdr, pif.rec);
+                packetsNotCommitted.remove();
+            }
+        } else {
+            packetsCommitted.add(qp.getZxid());
+        }
+        break;
+    case Leader.INFORM:
+    case Leader.INFORMANDACTIVATE:
+        PacketInFlight packet = new PacketInFlight();
+        packet.hdr = new TxnHeader();
+
+        if (qp.getType() == Leader.INFORMANDACTIVATE) {
+            ByteBuffer buffer = ByteBuffer.wrap(qp.getData());
+            long suggestedLeaderId = buffer.getLong();
+            byte[] remainingdata = new byte[buffer.remaining()];
+            buffer.get(remainingdata);
+            packet.rec = SerializeUtils.deserializeTxn(remainingdata, packet.hdr);
+            QuorumVerifier qv = self.configFromString(new String(((SetDataTxn)packet.rec).getData()));
+            boolean majorChange =
+                    self.processReconfig(qv, suggestedLeaderId, qp.getZxid(), true);
+            if (majorChange) {
+                throw new Exception("changes proposed in reconfig");
+            }
+        } else {
+            packet.rec = SerializeUtils.deserializeTxn(qp.getData(), packet.hdr);
+            // Log warning message if txn comes out-of-order
+            if (packet.hdr.getZxid() != lastQueued + 1) {
+                LOG.warn("Got zxid 0x"
+                        + Long.toHexString(packet.hdr.getZxid())
+                        + " expected 0x"
+                        + Long.toHexString(lastQueued + 1));
+            }
+            lastQueued = packet.hdr.getZxid();
+        }
+        if (!writeToTxnLog) {
+            // Apply to db directly if we haven't taken the snapshot
+            zk.processTxn(packet.hdr, packet.rec);
+        } else {
+            packetsNotCommitted.add(packet);
+            packetsCommitted.add(qp.getZxid());
+        }
+
+        break;                
+    case Leader.UPTODATE:
+        // leader 收到ack消息后，回复UPTODATE消息给follower
+        LOG.info("Learner received UPTODATE message");                                      
+        if (newLeaderQV!=null) {
+           boolean majorChange =
+               self.processReconfig(newLeaderQV, null, null, true);
+           if (majorChange) {
+               throw new Exception("changes proposed in reconfig");
+           }
+        }
+        
+        // 判断当前的协议版本，在Zab V1.0 (ZK 3.4+)版本中，follower收到 NEWLEADER 消息后会做一次 snapshot，但是在V1.0以前，在收到UPDATE消息后也会做snapshot。
+        // 但是在 V1.0 中，在 收到 NEWLEADER消息后还会再次收到 UPDATE的消息，这个标志位就是确保在V1.0版本不会做两次snapshot。
+        if (isPreZAB1_0) {
+            zk.takeSnapshot();
+            self.setCurrentEpoch(newEpoch);
+        }
+        self.setZooKeeperServer(zk);
+        self.adminServer.setZooKeeperServer(zk);
+        // 跳出当前的数据同步
+        break outerLoop;
+    case Leader.NEWLEADER: // leader在发送完数据后会发送一个Leader.NEWLEADER，代表当前leader的数据已经发送完成
+       if (qp.getData()!=null && qp.getData().length > 1) {
+           try {                       
+               QuorumVerifier qv = self.configFromString(new String(qp.getData()));
+               self.setLastSeenQuorumVerifier(qv, true);
+               newLeaderQV = qv;
+           } catch (Exception e) {
+               e.printStackTrace();
+           }
+       }
+       
+       // 是否要做一次 snapshot，只有在diff的情况下为false
+       if (snapshotNeeded) {
+           zk.takeSnapshot();
+       }
+       
+        self.setCurrentEpoch(newEpoch);
+        writeToTxnLog = true; // 在
+        isPreZAB1_0 = false;
+        
+        // 收到Leader.NEWLEADER后，回复ACK消息给leader
+        writePacket(new QuorumPacket(Leader.ACK, newLeaderZxid, null, null), true);
+        break;
+    }
+}
+
+```
+
+以上就是如果当前节点被确定为follower后，它同leader之间的数据同步过程，在数据同步完成之前follower本身是不能对外服务的。
+在数据同步完成之后，启动LearnerZookeeperServer，设置请求处理器，然后开始对外服务。
