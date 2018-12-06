@@ -535,6 +535,7 @@ private void sendPackets() throws InterruptedException {
                 p = queuedPackets.take();
             }
             
+            // 如果收到了关闭/异常 信息则退出
             if (p == proposalOfDeath) {
                 // Packet of death!
                 break;

@@ -468,7 +468,7 @@ while (self.isRunning()) {
            }
        }
        
-       // 是否要做一次 snapshot，只有在diff的情况下为false
+       // 是否要做一次 snapshot，只有在diff的情况下为false，因为在diff情况下，会将follower和leader之间差异的数据记录在事务日志中
        if (snapshotNeeded) {
            zk.takeSnapshot();
        }
