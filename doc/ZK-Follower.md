@@ -262,7 +262,7 @@ else if (qp.getType() == Leader.TRUNC) {
 
 下面我们大概看下leader发送数据和follower同步数据的过程。
 
-1、leader发送增量数据
+##### 3.3.1、leader发送增量数据
 
 下面的代码为Leader发送增量数据给follower的过程，其中去掉了日志代码
 ```
@@ -351,7 +351,7 @@ protected long queueCommittedProposals(Iterator<Proposal> itr,
 }  
 ```
 
-2、follower同步同步数据的代码如下：
+##### 3.3.2、follower同步同步数据的代码如下：
 
 ```
 outerLoop:
@@ -483,6 +483,75 @@ while (self.isRunning()) {
     }
 }
 
+```
+##### 3.3.3、启动follower 服务
+
+作为follower启动 LearnerZookeeperServer，下面先看下这个类的结构。
+
+### 4、处理数据
+
+follower 启动后就开处理来自leader 和客户端的请求。
+
+```
+protected void processPacket(QuorumPacket qp) throws Exception{
+    switch (qp.getType()) {
+    case Leader.PING:            
+        ping(qp);            
+        break;
+    case Leader.PROPOSAL:           
+        TxnHeader hdr = new TxnHeader();
+        Record txn = SerializeUtils.deserializeTxn(qp.getData(), hdr);
+        if (hdr.getZxid() != lastQueued + 1) {
+            LOG.warn("Got zxid 0x"
+                    + Long.toHexString(hdr.getZxid())
+                    + " expected 0x"
+                    + Long.toHexString(lastQueued + 1));
+        }
+        lastQueued = hdr.getZxid();
+        
+        if (hdr.getType() == OpCode.reconfig){
+           SetDataTxn setDataTxn = (SetDataTxn) txn;       
+           QuorumVerifier qv = self.configFromString(new String(setDataTxn.getData()));
+           self.setLastSeenQuorumVerifier(qv, true);                               
+        }
+        
+        fzk.logRequest(hdr, txn);
+        break;
+    case Leader.COMMIT:
+        fzk.commit(qp.getZxid());
+        break;
+        
+    case Leader.COMMITANDACTIVATE:
+       // get the new configuration from the request
+       Request request = fzk.pendingTxns.element();
+       SetDataTxn setDataTxn = (SetDataTxn) request.getTxn();                                                                                                      
+       QuorumVerifier qv = self.configFromString(new String(setDataTxn.getData()));                                
+
+       // get new designated leader from (current) leader's message
+       ByteBuffer buffer = ByteBuffer.wrap(qp.getData());    
+       long suggestedLeaderId = buffer.getLong();
+        boolean majorChange = 
+               self.processReconfig(qv, suggestedLeaderId, qp.getZxid(), true);
+       // commit (writes the new config to ZK tree (/zookeeper/config)                     
+       fzk.commit(qp.getZxid());
+        if (majorChange) {
+           throw new Exception("changes proposed in reconfig");
+       }
+       break;
+    case Leader.UPTODATE:
+        LOG.error("Received an UPTODATE message after Follower started");
+        break;
+    case Leader.REVALIDATE:
+        revalidate(qp);
+        break;
+    case Leader.SYNC:
+        fzk.sync();
+        break;
+    default:
+        LOG.warn("Unknown packet type: {}", LearnerHandler.packetToString(qp));
+        break;
+    }
+}
 ```
 
 以上就是如果当前节点被确定为follower后，它同leader之间的数据同步过程，在数据同步完成之前follower本身是不能对外服务的。

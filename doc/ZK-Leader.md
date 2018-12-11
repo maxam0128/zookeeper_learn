@@ -471,7 +471,7 @@ queuedPackets.add(new QuorumPacket(Leader.UPTODATE, -1, null, null));
 
 到这一步，leader和follower之间的数据同步就已经完成了，leader 也可以处理来自该follower的请求。
 
-### 3、阻塞同步选举周期
+### 3、同步选举周期
 
 参考下面代码实现(getEpochToPropose)：
 
@@ -521,21 +521,222 @@ public long getEpochToPropose(long sid, long lastAcceptedEpoch) throws Interrupt
 }
 ```
 
-### 4、// todo 吧
+### 4、处理配置版本
 
+看注释是为了保证leader 和 follower 之间的版本信息一致。这里使用场景具体不太清楚，以后研究吧。
+```
+zk.setZxid(ZxidUtils.makeZxid(epoch, 0));
 
+synchronized(this){
+    lastProposed = zk.getZxid();
+}
 
+newLeaderProposal.packet = new QuorumPacket(NEWLEADER, zk.getZxid(),
+       null, null);
 
+if ((newLeaderProposal.packet.getZxid() & 0xffffffffL) != 0) {
+    LOG.info("NEWLEADER proposal has Zxid of "
+            + Long.toHexString(newLeaderProposal.packet.getZxid()));
+}
 
+QuorumVerifier lastSeenQV = self.getLastSeenQuorumVerifier();
+QuorumVerifier curQV = self.getQuorumVerifier();
+if (curQV.getVersion() == 0 && curQV.getVersion() == lastSeenQV.getVersion()) {
+   
+   // 用户在没有指定配置的话version默认为0。一旦使用配置建立连接，那么version就会自增，以便它的优先级高于其他还没有使用初始配置完成连接的服务节点。
+   // 在NEWLEADER 消息中我们会选择一个新的version。但是选定new version之前要先达成一个协议，只有在我们发送/接受 UPTODATE消息时才改变version，而不是NEWLEADER消息。
+   // 换句话说，我们不能在这里改变curQV，因为他是提交议案验证器，在这里我们就使用new version 还未达成协议。
+   // 所以，我们使用lastSeenQuorumVerifier(发送过NEWLEADER消息)告诉follower 最新的version。
+    
+   // 在leader执行waitForEpochAck之前完成，因此在LearnerHandlers 在从waitForEpochAck返回之前，
+   // 使用leader的last-seen-quorumverifier构造 NEWLEADER 消息。
+   try {
+       QuorumVerifier newQV = self.configFromString(curQV.toString());
+       newQV.setVersion(zk.getZxid());
+       self.setLastSeenQuorumVerifier(newQV, true);    
+   } catch (Exception e) {
+       throw new IOException(e);
+   }
+}
+
+newLeaderProposal.addQuorumVerifier(self.getQuorumVerifier());
+if (self.getLastSeenQuorumVerifier().getVersion() > self.getQuorumVerifier().getVersion()){
+   newLeaderProposal.addQuorumVerifier(self.getLastSeenQuorumVerifier());
+}
+```
+### 5、确认 epoch 和 NEWLEADER 消息
+
+#### 5.1、确认 epoch
+
+这里和上面同步选举周期类似，同样需要leader收到来自大多数follower的确认才结束，否则一致阻塞在这里，实现也和上面的类似，代码在这里就不分析了。
+具体实现为：Leader#waitForEpochAck。
+这里要注意的一点是在LearnerHandler中的调用，在该方法中StateSummary#isMoreRecentThan 会判断follower的epoch和zxid是否比当前leader的要大。
+
+#### 5.2、确认 NEWLEADER
+
+在确认环境都是大同小异，这里我们主要看下异常的处理。
+
+```
+try {
+    
+     // 阻塞等待确认 NewLeader 消息   
+     waitForNewLeaderAck(self.getId(), zk.getZxid());
+ } catch (InterruptedException e) {
+     
+     // 如果发生异常，则关闭所有的LeaderHandler，同时关闭 LearnerCnxAcceptor 
+     shutdown("Waiting for a quorum of followers, only synced with sids: [ "
+             + newLeaderProposal.ackSetsToString() + " ]");
+     HashSet<Long> followerSet = new HashSet<Long>();
+     
+     // 收集已投票的 follower
+     for(LearnerHandler f : getLearners()) {
+         if (self.getQuorumVerifier().getVotingMembers().containsKey(f.getSid())){
+             followerSet.add(f.getSid());
+         }
+     }    
+     boolean initTicksShouldBeIncreased = true;
+     
+     // 如果没收到大多数follower的确认，则不会自增 initTicks
+     for (Proposal.QuorumVerifierAcksetPair qvAckset:newLeaderProposal.qvAcksetPairs) {
+         if (!qvAckset.getQuorumVerifier().containsQuorum(followerSet)) {
+             initTicksShouldBeIncreased = false;
+             break;
+         }
+     }                  
+     if (initTicksShouldBeIncreased) {
+         LOG.warn("Enough followers present. "+
+                 "Perhaps the initTicks need to be increased.");
+     }
+     return;
+ }
+```
  
+### 6、启动 LeaderZookeeperServer 
 
+我们先看代码分析，然后逐个分析每个
+```
+ private synchronized void startZkServer() {
+    // Update lastCommitted and Db's zxid to a value representing the new epoch
+    
+    // 用新的 new epoch 更新 lastCommitted 和 db 的zxid 
+    lastCommitted = zk.getZxid();
+    
+    // 将 new config 信息应用于本身
+    QuorumVerifier newQV = self.getLastSeenQuorumVerifier();
+    
+    // 根据当前的配置信息来选择下一次重配置时的leader，如果当前的leader也是下一次投票者时，那保持leader 不变
+    // 否则，返回下一次leader的sid，默认取投票箱的最后一个follower 
+    Long designatedLeader = getDesignatedLeader(newLeaderProposal, zk.getZxid());                                         
 
+    // 处理重配置
+    // QuorumVerifier newQV 
+    // 重配置后的leader
+    // 当前的 zxid
+    // 是否重新选举
+    self.processReconfig(newQV, designatedLeader, zk.getZxid(), true);
+    
+    // 如果重配置后的leader 不是当前节点，则不允许当前节点提交
+    if (designatedLeader != self.getId()) {
+        allowedToCommit = false;
+    }
+    
+    // 启动zk server 服务
+    zk.startup();
+    /*
+     * Update the election vote here to ensure that all members of the
+     * ensemble report the same vote to new servers that start up and
+     * send leader election notifications to the ensemble.
+     * 
+     * @see https://issues.apache.org/jira/browse/ZOOKEEPER-1732
+     */
+     // 更新选举周期
+    self.updateElectionVote(getEpoch());
 
+    zk.getZKDatabase().setlastProcessedZxid(zk.getZxid());
+}
+```
 
+### 7、发送心跳包给 follower
 
+```
+boolean tickSkip = true;
+// If not null then shutdown this leader
+String shutdownMessage = null;
 
+while (true) {
+    synchronized (this) {
+        long start = Time.currentElapsedTime();
+        long cur = start;
+        long end = start + self.tickTime / 2;
+        
+        // 发送心跳周期
+        while (cur < end) {
+            wait(end - cur);
+            cur = Time.currentElapsedTime();
+        }
+        
+        if (!tickSkip) {
+            self.tick.incrementAndGet();
+        }
 
+        // We use an instance of SyncedLearnerTracker to
+        // track synced learners to make sure we still have a
+        // quorum of current (and potentially next pending) view.
+        
+        // Learner 同步追中器
+        SyncedLearnerTracker syncedAckSet = new SyncedLearnerTracker();
+        syncedAckSet.addQuorumVerifier(self.getQuorumVerifier());
+        if (self.getLastSeenQuorumVerifier() != null
+                && self.getLastSeenQuorumVerifier().getVersion() > self
+                        .getQuorumVerifier().getVersion()) {
+            syncedAckSet.addQuorumVerifier(self
+                    .getLastSeenQuorumVerifier());
+        }
+        
+        // 将自身添加进去，默认自身一直是同步状态，所以大多数也包括了自己
+        syncedAckSet.addAck(self.getId());
+        
+        // 遍历LearnerHandler，获取已经同步的follower
+        for (LearnerHandler f : getLearners()) {
+            if (f.synced()) {
+                syncedAckSet.addAck(f.getSid());
+            }
+        }
 
+        // 检查运行状态，包括zkServer 和自身
+        if (!this.isRunning()) {
+            // set shutdown flag
+            shutdownMessage = "Unexpected internal error";
+            break;
+        }
+        
+        // 如果在两个心跳周期内大多数的follower还没确认，则退出重新选举
+        if (!tickSkip && !syncedAckSet.hasAllQuorums()) {
+            // Lost quorum of last committed and/or last proposed
+            // config, set shutdown flag
+            shutdownMessage = "Not sufficient followers synced, only synced with sids: [ "
+                    + syncedAckSet.ackSetsToString() + " ]";
+            break;
+        }
+        tickSkip = !tickSkip;
+    }
+    
+    // 发送心跳包给follower
+    for (LearnerHandler f : getLearners()) {
+        f.ping();
+    }
+}
 
+// 可以看出，如果shutdownMessage 不为空时是才会关闭leader 服务，然后重新进入一下轮选举
+if (shutdownMessage != null) {
+    // 1、关闭 cnxAcceptor
+    // 2、将zkServer 和 admin server  设置为null
+    // 3、关闭当前sock连接
+    // 4、关闭 zkServer
+    // 5、关闭 LearnerHandler
+    shutdown(shutdownMessage);
+    // leader goes in looking state
+}
+```
 
-
+以上就是节点在当选为Leader之后，初始化的过程中执行的一系列动作。 

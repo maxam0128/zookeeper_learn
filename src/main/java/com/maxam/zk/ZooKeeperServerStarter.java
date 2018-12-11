@@ -10,7 +10,7 @@ public class ZooKeeperServerStarter {
 
 
 	public static void main(String[] args) {
-		String str = "C:\\Users\\hzfanjinlong\\IdeaProjects\\springlearning\\zookeeper\\src\\main\\resources\\zoo1.cfg";
+		String str = "C:\\Users\\hzfanjinlong\\IdeaProjects\\springlearning\\zookeeper\\src\\main\\resources\\zoo3.cfg";
 		String [] arg1 = new String[]{str};
 		QuorumPeerMain.main(arg1);
 	}
