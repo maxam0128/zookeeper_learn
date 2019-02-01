@@ -1,0 +1,822 @@
+# AbstractApplicationContext
+
+## AbstractApplicationContext 总览
+无论通过什么方式启动Spring，最后的都会通过 AbstractApplicationContext#refresh方法来启动刷新容器，这里使用模板设计模式，启动过程中每个节点都可以由子类个性化实现。
+这一节主要看下AbstractApplicationContext#refresh方法的实现。
+
+代码实现如下：
+
+```
+@Override
+public void refresh() throws BeansException, IllegalStateException {
+    
+    // 可以看出，Spring 容器在启动过程中是单线程执行的
+    synchronized (this.startupShutdownMonitor) {
+        // 准备刷新所需的上下文环境
+        prepareRefresh();
+
+        // get and refresh Bean factory
+        ConfigurableListableBeanFactory beanFactory = obtainFreshBeanFactory();
+
+        // 
+        prepareBeanFactory(beanFactory);
+
+        try {
+            // Allows post-processing of the bean factory in context subclasses.
+            postProcessBeanFactory(beanFactory);
+
+            // Invoke factory processors registered as beans in the context.
+            invokeBeanFactoryPostProcessors(beanFactory);
+
+            // Register bean processors that intercept bean creation.
+            registerBeanPostProcessors(beanFactory);
+
+            // Initialize message source for this context.
+            initMessageSource();
+
+            // Initialize event multicaster for this context.
+            initApplicationEventMulticaster();
+
+            // Initialize other special beans in specific context subclasses.
+            onRefresh();
+
+            // Check for listener beans and register them.
+            registerListeners();
+
+            // Instantiate all remaining (non-lazy-init) singletons.
+            finishBeanFactoryInitialization(beanFactory);
+
+            // Last step: publish corresponding event.
+            finishRefresh();
+        }
+
+        catch (BeansException ex) {
+            if (logger.isWarnEnabled()) {
+                logger.warn("Exception encountered during context initialization - " +
+                        "cancelling refresh attempt: " + ex);
+            }
+
+            // Destroy already created singletons to avoid dangling resources.
+            destroyBeans();
+
+            // Reset 'active' flag.
+            cancelRefresh(ex);
+
+            // Propagate exception to caller.
+            throw ex;
+        }
+
+        finally {
+            // Reset common introspection caches in Spring's core, since we
+            // might not ever need metadata for singleton beans anymore...
+            resetCommonCaches();
+        }
+    }
+}
+
+```
+
+## 1、prepareRefresh
+
+这个方法主要功能带你就是准备容器刷新所需的上下文环境，我们首先看 AbstractApplicationContext#prepareRefresh 默认实现。
+
+```
+protected void prepareRefresh() {
+    
+    // 设置启动时间及标志位
+    this.startupDate = System.currentTimeMillis();
+    this.closed.set(false);
+    this.active.set(true);
+
+    if (logger.isInfoEnabled()) {
+        logger.info("Refreshing " + this);
+    }
+
+    // Initialize any placeholder property sources in the context environment
+    // 初始化所有上下文环境中的资源文件中的占位符
+    initPropertySources();
+
+    // 校验所有必须的属性是否存在，参考 ConfigurablePropertyResolver#setRequiredProperties
+    getEnvironment().validateRequiredProperties();
+
+    // 应用事件集合
+    this.earlyApplicationEvents = new LinkedHashSet<ApplicationEvent>();
+}
+```
+
+对于 prepareRefresh 方法的实现有两个重要的子类，分别为 AnnotationConfigApplicationContext 和 AnnotationConfigEmbeddedWebApplicationContext，他们两个的实现是相同的，具体可以参考Springboot环境下
+AnnotationConfigEmbeddedWebApplicationContext 的实现。下面我们看下对于属性资源的初始化，以web环境下的 GenericWebApplicationContext 为例。
+
+### GenericWebApplicationContext#initPropertySources
+
+```
+@Override
+protected void initPropertySources() {
+    
+    // 通过springboot 启动环境可知，在web环境下会默认初始化一个 StandardServletEnvironment 
+    ConfigurableEnvironment env = getEnvironment();
+    if (env instanceof ConfigurableWebEnvironment) {
+        
+        // StandardServletEnvironment#initPropertySources 
+        //          -> WebApplicationContextUtils.initServletPropertySources
+        // 这里主要是根据配置属性初始化一些servlet参数
+        ((ConfigurableWebEnvironment) env).initPropertySources(this.servletContext, null);
+    }
+}
+```
+## 2、obtainFreshBeanFactory
+
+告诉子类刷新内部的 BeanFactory，最后返回已经刷新的BeanFactory 实例。默认实现如下：
+
+```
+AbstractApplicationContext#obtainFreshBeanFactory
+
+protected ConfigurableListableBeanFactory obtainFreshBeanFactory() {
+    refreshBeanFactory();
+    ConfigurableListableBeanFactory beanFactory = getBeanFactory();
+    if (logger.isDebugEnabled()) {
+        logger.debug("Bean factory for " + getDisplayName() + ": " + beanFactory);
+    }
+    return beanFactory;
+}
+```
+AbstractApplicationContext#refreshBeanFactory 方法是一个抽象方法，它的实现有两个 AbstractRefreshableApplicationContext 和 GenericApplicationContext。
+GenericApplicationContext主要在Springboot的场景下使用， AbstractRefreshableApplicationContext 在spring通过其他方式启动时使用，下面分别看下这两个子类的实现。
+
+### 2.1、GenericApplicationContext#refreshBeanFactory
+
+```
+@Override
+protected final void refreshBeanFactory() throws IllegalStateException {
+    
+    // 通过cas的方式将 refreshed 标志位置为true
+    if (!this.refreshed.compareAndSet(false, true)) {
+        throw new IllegalStateException(
+                "GenericApplicationContext does not support multiple refresh attempts: just call 'refresh' once");
+    }
+    // 设置 BeanFactory 序列化 id
+    this.beanFactory.setSerializationId(getId());
+}
+```
+
+### 2.2、AbstractRefreshableApplicationContext#refreshBeanFactory
+
+```
+@Override
+protected final void refreshBeanFactory() throws BeansException {
+
+    // 如果已经实例化了 BeanFactory，则先销毁，再重新创建
+    if (hasBeanFactory()) {
+        destroyBeans();
+        closeBeanFactory();
+    }
+    try {
+        
+        // 创建一个 DefaultListableBeanFactory 实例
+        DefaultListableBeanFactory beanFactory = createBeanFactory();
+        beanFactory.setSerializationId(getId());
+        
+        // allowCircularReferences 是否允许循环引用
+        // allowBeanDefinitionOverriding beanDefinition 是否可以被重写
+        customizeBeanFactory(beanFactory);
+        
+        // 1、load BeanDefinition 
+        // 2、将第一步中的BeanDefinition 注册到 BeanFactory中
+        loadBeanDefinitions(beanFactory);
+        synchronized (this.beanFactoryMonitor) {
+            this.beanFactory = beanFactory;
+        }
+    }
+    catch (IOException ex) {
+        throw new ApplicationContextException("I/O error parsing bean definition source for " + getDisplayName(), ex);
+    }
+}
+```
+
+#### 2.3、AbstractRefreshableApplicationContext#loadBeanDefinitions
+
+可以知道这个抽象方法有4个实现：AbstractXmlApplicationContext、AnnotationConfigWebApplicationContext、XmlWebApplicationContext 和 GroovyWebApplicationContext。下面我们主要看下前三个实现。
+
+对于AbstractXmlApplicationContext，主要应用非web环境下对通过xml配置bean的加载，主要有两个实现类：ClassPathXmlApplicationContext 和 FileSystemXmlApplicationContext，他们分别是在类路径和文件绝对路径加载bean。
+
+#### 2.3.1、AbstractXmlApplicationContext#loadBeanDefinitions
+
+```
+@Override
+protected void loadBeanDefinitions(DefaultListableBeanFactory beanFactory) throws BeansException, IOException {
+    // Create a new XmlBeanDefinitionReader for the given BeanFactory.
+    // 创建 xml BeanDefinition Reader
+    XmlBeanDefinitionReader beanDefinitionReader = new XmlBeanDefinitionReader(beanFactory);
+
+    // Configure the bean definition reader with this context's
+    // resource loading environment.
+    beanDefinitionReader.setEnvironment(this.getEnvironment());
+    
+    // 设置ResourceLoader 
+    // 可以知道 AbstractXmlApplicationContext 
+    //                -> AbstractRefreshableConfigApplicationContext 
+    //                    -> AbstractRefreshableApplicationContext
+    //                          -> AbstractApplicationContext extends DefaultResourceLoader
+    beanDefinitionReader.setResourceLoader(this);
+    
+    // 
+    beanDefinitionReader.setEntityResolver(new ResourceEntityResolver(this));
+
+    // 初始化 beanDefinitionReader，允许子类自定义初始化reader 的方法
+    initBeanDefinitionReader(beanDefinitionReader);
+    // load beanDefinition
+    loadBeanDefinitions(beanDefinitionReader);
+}
+```
+- AbstractXmlApplicationContext#loadBeanDefinitions
+```
+protected void loadBeanDefinitions(XmlBeanDefinitionReader reader) throws BeansException, IOException {
+    
+    // 通过配置资源加载bean
+    Resource[] configResources = getConfigResources();
+    if (configResources != null) {
+        reader.loadBeanDefinitions(configResources);
+    }
+    // 如果配置资源为空，通过配置路径去加载 bean
+    String[] configLocations = getConfigLocations();
+    if (configLocations != null) {
+        reader.loadBeanDefinitions(configLocations);
+    }
+}
+```
+
+接下来通过前面初始化的 XmlBeanDefinitionReader 来load beanDefinition
+
+```
+@Override
+public int loadBeanDefinitions(Resource... resources) throws BeanDefinitionStoreException {
+    Assert.notNull(resources, "Resource array must not be null");
+    int counter = 0;
+    for (Resource resource : resources) {
+        counter += loadBeanDefinitions(resource);
+    }
+    // 加载bean 数量
+    return counter;
+}
+```
+
+XmlBeanDefinitionReader#loadBeanDefinitions -> 
+    XmlBeanDefinitionReader#doLoadBeanDefinitions
+下面是简化过的 doLoadBeanDefinitions：
+```
+
+// 这里会从指定的xml文件中的 load beanDefinition
+// inputSource ->SAX InputSource 
+// resource : xml 资源文件
+protected int doLoadBeanDefinitions(InputSource inputSource, Resource resource)
+        throws BeanDefinitionStoreException {
+    try {
+        // xml 文件解析成为document
+        Document doc = doLoadDocument(inputSource, resource);
+        return registerBeanDefinitions(doc, resource);
+    }
+}
+```
+
+- XmlBeanDefinitionReader#registerBeanDefinitions
+
+通过BeanDefinitionDocumentReader 读取 Document中包含的bean，并且 将它注册到当前的容器中(BeanFactory)
+
+```
+public int registerBeanDefinitions(Document doc, Resource resource) throws BeanDefinitionStoreException {
+
+    // 可以看出使用的是默认的 DefaultBeanDefinitionDocumentReader
+    BeanDefinitionDocumentReader documentReader = createBeanDefinitionDocumentReader();
+    
+    // 获取当前已经注册的bean 的数量
+    int countBefore = getRegistry().getBeanDefinitionCount();
+    
+    // 注册doc中的bean
+    documentReader.registerBeanDefinitions(doc, createReaderContext(resource));
+    return getRegistry().getBeanDefinitionCount() - countBefore;
+}
+```
+下面我们看 XmlBeanDefinitionReader#createReaderContext
+
+```
+public XmlReaderContext createReaderContext(Resource resource) {
+    // 可以看出这里有一个getNamespaceHandlerResolver
+    return new XmlReaderContext(resource, this.problemReporter, this.eventListener,
+            this.sourceExtractor, this, getNamespaceHandlerResolver());
+}
+```
+下面我们看getNamespaceHandlerResolver 这个方法的实现：
+```
+public NamespaceHandlerResolver getNamespaceHandlerResolver() {
+    
+    // 如果为空则创建 createDefaultNamespaceHandlerResolver 
+    if (this.namespaceHandlerResolver == null) {
+        this.namespaceHandlerResolver = createDefaultNamespaceHandlerResolver();
+    }
+    return this.namespaceHandlerResolver;
+}
+
+/**
+ * Create the default implementation of {@link NamespaceHandlerResolver} used if none is specified.
+ * Default implementation returns an instance of {@link DefaultNamespaceHandlerResolver}.
+ */
+ 
+ // 可以看出这里如果没有指定 NamespaceHandlerResolver，会创建一个默认 DefaultNamespaceHandlerResolver 
+ // 
+protected NamespaceHandlerResolver createDefaultNamespaceHandlerResolver() {
+    return new DefaultNamespaceHandlerResolver(getResourceLoader().getClassLoader());
+}
+
+// 通过 DefaultNamespaceHandlerResolver 构造函数可以得知，它会从默认的位置加载所有的 NamespaceHandler(主要用于将xml中定义的内容解析成对应的beanDefinition)
+// DEFAULT_HANDLER_MAPPINGS_LOCATION = "META-INF/spring.handlers"
+// 具体可以参考 dubbo的实现，org.apache.dubbo.config.spring.schema.DubboNamespaceHandler
+public DefaultNamespaceHandlerResolver(ClassLoader classLoader) {
+    this(classLoader, DEFAULT_HANDLER_MAPPINGS_LOCATION);
+}
+```
+接下来继续回到 BeanDefinitionDocumentReader#registerBeanDefinitions(doc, createReaderContext(resource)) 这里，
+看看xml解析后的bean是如何被注册到BeanFactory中的。这部分的调用链路如下：
+
+```
+// BeanDefinitionDocumentReader#registerBeanDefinitions
+//     ->BeanDefinitionDocumentReader#doRegisterBeanDefinitions
+
+// 下面我们看注册bean的这个过程
+protected void doRegisterBeanDefinitions(Element root) {
+    // Any nested <beans> elements will cause recursion in this method. In
+    // order to propagate and preserve <beans> default-* attributes correctly,
+    // keep track of the current (parent) delegate, which may be null. Create
+    // the new (child) delegate with a reference to the parent for fallback purposes,
+    // then ultimately reset this.delegate back to its original (parent) reference.
+    // this behavior emulates a stack of delegates without actually necessitating one.
+
+    BeanDefinitionParserDelegate parent = this.delegate;
+    this.delegate = createDelegate(getReaderContext(), root, parent);
+
+    if (this.delegate.isDefaultNamespace(root)) {
+        String profileSpec = root.getAttribute(PROFILE_ATTRIBUTE);
+        if (StringUtils.hasText(profileSpec)) {
+            String[] specifiedProfiles = StringUtils.tokenizeToStringArray(
+                    profileSpec, BeanDefinitionParserDelegate.MULTI_VALUE_ATTRIBUTE_DELIMITERS);
+            if (!getReaderContext().getEnvironment().acceptsProfiles(specifiedProfiles)) {
+                if (logger.isInfoEnabled()) {
+                    logger.info("Skipped XML bean definition file due to specified profiles [" + profileSpec +
+                            "] not matching: " + getReaderContext().getResource());
+                }
+                return;
+            }
+        }
+    }
+    
+    // 预处理
+    preProcessXml(root);
+    // 解析beanDefinition 
+    parseBeanDefinitions(root, this.delegate);
+    // 解析后处理
+    postProcessXml(root);
+
+    this.delegate = parent;
+}
+
+```
+下面在看下parseBeanDefinitions
+
+```
+protected void parseBeanDefinitions(Element root, BeanDefinitionParserDelegate delegate) {
+    
+    // 处理默认的namespace
+    // 通过这个 BeanDefinitionParserDelegate#isDefaultNamespace 的实现可以得知
+    // 对于默认的判断是通过spring自定义的字符串比较
+    // BEANS_NAMESPACE_URI = "http://www.springframework.org/schema/beans" 
+    if (delegate.isDefaultNamespace(root)) {
+        NodeList nl = root.getChildNodes();
+        for (int i = 0; i < nl.getLength(); i++) {
+            Node node = nl.item(i);
+            if (node instanceof Element) {
+                Element ele = (Element) node;
+                if (delegate.isDefaultNamespace(ele)) {
+                    parseDefaultElement(ele, delegate);
+                }
+                else {
+                    // 处理自定义的 namespace 
+                    delegate.parseCustomElement(ele);
+                }
+            }
+        }
+    }
+    else {
+        // 处理自定义 namespace
+        delegate.parseCustomElement(root);
+    }
+}
+
+```
+
+- 1、Spring 默认bean的处理 parseDefaultElement
+
+```
+private void parseDefaultElement(Element ele, BeanDefinitionParserDelegate delegate) {
+    if (delegate.nodeNameEquals(ele, IMPORT_ELEMENT)) {
+        // 处理import 标签
+        importBeanDefinitionResource(ele);
+    }
+    else if (delegate.nodeNameEquals(ele, ALIAS_ELEMENT)) {
+        // 注册别名
+        processAliasRegistration(ele);
+    }
+    else if (delegate.nodeNameEquals(ele, BEAN_ELEMENT)) {
+        // 处理 bean
+        processBeanDefinition(ele, delegate);
+    }
+    else if (delegate.nodeNameEquals(ele, NESTED_BEANS_ELEMENT)) {
+        // 递归处理 beans 标签下的每个bean
+        doRegisterBeanDefinitions(ele);
+    }
+}
+```
+解并注册bean，processBeanDefinition
+```
+protected void processBeanDefinition(Element ele, BeanDefinitionParserDelegate delegate) {
+    
+    // 解析bean
+    BeanDefinitionHolder bdHolder = delegate.parseBeanDefinitionElement(ele);
+    if (bdHolder != null) {
+        bdHolder = delegate.decorateBeanDefinitionIfRequired(ele, bdHolder);
+        try {
+            // Register the final decorated instance.
+            // 注册bean
+            BeanDefinitionReaderUtils.registerBeanDefinition(bdHolder, getReaderContext().getRegistry());
+        }
+        catch (BeanDefinitionStoreException ex) {
+            getReaderContext().error("Failed to register bean definition with name '" +
+                    bdHolder.getBeanName() + "'", ele, ex);
+        }
+        // Send registration event.
+        getReaderContext().fireComponentRegistered(new BeanComponentDefinition(bdHolder));
+    }
+}
+```
+
+- 2 调用BeanDefinitionParserDelegate#parseCustomElement 处理自定义的xml结构
+```
+public BeanDefinition parseCustomElement(Element ele, BeanDefinition containingBd) {
+    // 根据xml的元素获取当前xml的namespace
+    String namespaceUri = getNamespaceURI(ele);
+    
+    // 获取对应的 NamespaceHandler
+    // 在 DefaultNamespaceHandlerResolver 初始化的时候，会加载 META-INF/spring.handlers 文件中配置的 NamespaceHandler
+    // 并以K-V的形式存到 handlerMappings 中，
+    // DefaultNamespaceHandlerResolver#resolve 方法会根据 namespaceUri 找出对应的 NamespaceHandler，并且实例化，然后重新放入 handlerMappings 中
+    // 核心代码如下：
+    // Class<?> handlerClass = ClassUtils.forName(className, this.classLoader);
+    // if (!NamespaceHandler.class.isAssignableFrom(handlerClass)) {
+    //     throw new FatalBeanException("Class [" + className + "] for namespace [" + namespaceUri +
+    //             "] does not implement the [" + NamespaceHandler.class.getName() + "] interface");
+    // }
+    // NamespaceHandler namespaceHandler = (NamespaceHandler) BeanUtils.instantiateClass(handlerClass);
+    // 调用 NamespaceHandler 初始化方法，注册beanDefinition 的解析器(实现 BeanDefinitionParser )，具体可参考 DubboNamespaceHandler
+    // namespaceHandler.init();
+    // handlerMappings.put(namespaceUri, namespaceHandler);
+    // return namespaceHandler;
+    
+    NamespaceHandler handler = this.readerContext.getNamespaceHandlerResolver().resolve(namespaceUri);
+    if (handler == null) {
+        error("Unable to locate Spring NamespaceHandler for XML schema namespace [" + namespaceUri + "]", ele);
+        return null;
+    }
+    
+    // NamespaceHandler#parse 将xml中的内容解析为beanDefinition，并且注册到容器中
+    // beanDefinition的注册，ParserContext#readerContext中是持有当前容器的引用
+    // 在DubboBeanDefinitionParser 中也是通过parserContext.getRegistry().registerBeanDefinition(id, beanDefinition) 来实现对于已解析好的bean的注册
+    return handler.parse(ele, new ParserContext(this.readerContext, this, containingBd));
+}
+```
+
+到这里，无论spring 是以哪种方式启动，它的BeanFactory 算是已经初始化完成了。只不过在以xml方式启动的时候，这个时候所有的bean已经加载进来了，springboot配置的方式启动的时候只加载了启动的配置类。
+
+## 3、prepareBeanFactory
+
+这个方法好像没啥好说的，主要就是配置 BeanFactory 所需的一些特性。
+
+## 4、postProcessBeanFactory
+
+- 1、AbstractApplicationContext#postProcessBeanFactory 的抽象方法，由子类去实现。在Springboot环境下参考AnnotationConfigEmbeddedWebApplicationContext，代码如下：
+
+```
+@Override
+protected void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+    // EmbeddedWebApplicationContext#postProcessBeanFactory
+    // add  WebApplicationContextServletContextAwareProcessor beanPostProcessor
+    // ingnore ServletContextAware
+    super.postProcessBeanFactory(beanFactory);
+    
+    // 如果配置了 basePackages，加载对应包下的所有bean，并注册到 beanfactory中
+    // springboot 启动时，下面两个参数为空
+    if (this.basePackages != null && this.basePackages.length > 0) {
+        this.scanner.scan(this.basePackages);
+    }
+    // 
+    if (this.annotatedClasses != null && this.annotatedClasses.length > 0) {
+        this.reader.register(this.annotatedClasses);
+    }
+}
+```
+
+- 2、其他方式启动spring时的web 环境AbstractRefreshableWebApplicationContext
+
+```
+@Override
+protected void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+    beanFactory.addBeanPostProcessor(new ServletContextAwareProcessor(this.servletContext, this.servletConfig));
+    beanFactory.ignoreDependencyInterface(ServletContextAware.class);
+    beanFactory.ignoreDependencyInterface(ServletConfigAware.class);
+    
+    // 将servlet 注册到当前web上下文
+    WebApplicationContextUtils.registerWebApplicationScopes(beanFactory, this.servletContext);
+    WebApplicationContextUtils.registerEnvironmentBeans(beanFactory, this.servletContext, this.servletConfig);
+}
+```
+对于其他子类的实现这里暂时就不分析了。
+
+## 5、invokeBeanFactoryPostProcessors
+
+调用BeanFactoryPostProcessor，并将它们注册到BeanFactory中，下面主要看
+PostProcessorRegistrationDelegate.invokeBeanFactoryPostProcessors 实现，代码如下：
+
+```
+public static void invokeBeanFactoryPostProcessors(
+        ConfigurableListableBeanFactory beanFactory, List<BeanFactoryPostProcessor> beanFactoryPostProcessors) {
+
+    // Invoke BeanDefinitionRegistryPostProcessors first, if any.
+    Set<String> processedBeans = new HashSet<String>();
+
+    if (beanFactory instanceof BeanDefinitionRegistry) {
+        BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
+        List<BeanFactoryPostProcessor> regularPostProcessors = new LinkedList<BeanFactoryPostProcessor>();
+        List<BeanDefinitionRegistryPostProcessor> registryPostProcessors =
+                new LinkedList<BeanDefinitionRegistryPostProcessor>();
+
+        for (BeanFactoryPostProcessor postProcessor : beanFactoryPostProcessors) {
+            if (postProcessor instanceof BeanDefinitionRegistryPostProcessor) {
+                BeanDefinitionRegistryPostProcessor registryPostProcessor =
+                        (BeanDefinitionRegistryPostProcessor) postProcessor;
+                
+                // 如果为 BeanDefinitionRegistryPostProcessor，则调用 postProcessBeanDefinitionRegistry 注册后处理器
+                // 可以参考 CachingMetadataReaderFactoryPostProcessor ，它注册了一个beanName:internalCachingMetadataReaderFactory，class：SharedMetadataReaderFactoryBean
+                // 并且给 internalConfigurationAnnotationProcessor->ConfigurationClassPostProcessor 添加了metadataReaderFactory-> RuntimeBeanReference(beanName) 属性 
+                // 这个属性的注册是在实例化 AnnotationConfigEmbeddedWebApplicationContext时注册进去的。
+                // AnnotationConfigEmbeddedWebApplicationContext 
+                //    -> AnnotatedBeanDefinitionReader 
+                //         -> AnnotationConfigUtils.registerAnnotationConfigProcessors(this.registry)
+                registryPostProcessor.postProcessBeanDefinitionRegistry(registry);
+                registryPostProcessors.add(registryPostProcessor);
+            }
+            else {
+                // 普通的 processor
+                regularPostProcessors.add(postProcessor);
+            }
+        }
+
+        // 不会初始化FactoryBean。普通bean的初始化是在 bean factory post-processors中进行，会将实现了 PriorityOrdered, Ordered和其他BeanDefinitionRegistryPostProcessors 区分开。
+        // 通过beanFactory#getBeanNamesForType方法的实现可知，所有factoryBean的 name前缀 为 &
+        String[] postProcessorNames =
+                beanFactory.getBeanNamesForType(BeanDefinitionRegistryPostProcessor.class, true, false);
+
+        // First, invoke the BeanDefinitionRegistryPostProcessors that implement PriorityOrdered.
+        List<BeanDefinitionRegistryPostProcessor> priorityOrderedPostProcessors = new ArrayList<BeanDefinitionRegistryPostProcessor>();
+        // 可以看出这里只是实例化了 实现了 PriorityOrdered，Ordered接口的 BeanDefinitionRegistryPostProcessors
+        // springboot 下面参考 org.springframework.context.annotation.internalConfigurationAnnotationProcessor
+        for (String ppName : postProcessorNames) {
+            // 如果当前的bean是 PriorityOrdered 类型，则通过 beanFactory#getBean 来实例化当前的bean
+            if (beanFactory.isTypeMatch(ppName, PriorityOrdered.class)) {
+                priorityOrderedPostProcessors.add(beanFactory.getBean(ppName, BeanDefinitionRegistryPostProcessor.class));
+                processedBeans.add(ppName);
+            }
+        }
+        sortPostProcessors(beanFactory, priorityOrderedPostProcessors);
+        registryPostProcessors.addAll(priorityOrderedPostProcessors);
+        
+        // 这里会调用实例化后的 priorityOrderedPostProcessors( -> ConfigurationClassPostProcessor#processConfigBeanDefinitions)
+        // processConfigBeanDefinitions 处理配置bean
+        // ConfigurationClassParser 配置类解析器
+        // ConfigurationClassParser#parse SpringBoot下处理Starter 的配置类，通过Starter 来读取配置类的所有配置项，后续我们看这个类的详细实现
+        // Springboot 配置的话，这里会解析当前类路径下的所有类
+        invokeBeanDefinitionRegistryPostProcessors(priorityOrderedPostProcessors, registry);
+
+        // Next, invoke the BeanDefinitionRegistryPostProcessors that implement Ordered.
+        // 调用实现了Ordered 接口的类的
+        postProcessorNames = beanFactory.getBeanNamesForType(BeanDefinitionRegistryPostProcessor.class, true, false);
+        List<BeanDefinitionRegistryPostProcessor> orderedPostProcessors = new ArrayList<BeanDefinitionRegistryPostProcessor>();
+        for (String ppName : postProcessorNames) {
+            if (!processedBeans.contains(ppName) && beanFactory.isTypeMatch(ppName, Ordered.class)) {
+                orderedPostProcessors.add(beanFactory.getBean(ppName, BeanDefinitionRegistryPostProcessor.class));
+                processedBeans.add(ppName);
+            }
+        }
+        sortPostProcessors(beanFactory, orderedPostProcessors);
+        registryPostProcessors.addAll(orderedPostProcessors);
+        
+        // 
+        invokeBeanDefinitionRegistryPostProcessors(orderedPostProcessors, registry);
+
+        // Finally, invoke all other BeanDefinitionRegistryPostProcessors until no further ones appear.
+        boolean reiterate = true;
+        while (reiterate) {
+            reiterate = false;
+            postProcessorNames = beanFactory.getBeanNamesForType(BeanDefinitionRegistryPostProcessor.class, true, false);
+            for (String ppName : postProcessorNames) {
+                if (!processedBeans.contains(ppName)) {
+                    BeanDefinitionRegistryPostProcessor pp = beanFactory.getBean(ppName, BeanDefinitionRegistryPostProcessor.class);
+                    registryPostProcessors.add(pp);
+                    processedBeans.add(ppName);
+                    pp.postProcessBeanDefinitionRegistry(registry);
+                    reiterate = true;
+                }
+            }
+        }
+
+        // Now, invoke the postProcessBeanFactory callback of all processors handled so far.
+        invokeBeanFactoryPostProcessors(registryPostProcessors, beanFactory);
+        invokeBeanFactoryPostProcessors(regularPostProcessors, beanFactory);
+    }
+
+    else {
+        // Invoke factory processors registered with the context instance.
+        invokeBeanFactoryPostProcessors(beanFactoryPostProcessors, beanFactory);
+    }
+
+    // Do not initialize FactoryBeans here: We need to leave all regular beans
+    // uninitialized to let the bean factory post-processors apply to them!
+    String[] postProcessorNames =
+            beanFactory.getBeanNamesForType(BeanFactoryPostProcessor.class, true, false);
+
+    // Separate between BeanFactoryPostProcessors that implement PriorityOrdered,
+    // Ordered, and the rest.
+    List<BeanFactoryPostProcessor> priorityOrderedPostProcessors = new ArrayList<BeanFactoryPostProcessor>();
+    List<String> orderedPostProcessorNames = new ArrayList<String>();
+    List<String> nonOrderedPostProcessorNames = new ArrayList<String>();
+    for (String ppName : postProcessorNames) {
+        if (processedBeans.contains(ppName)) {
+            // skip - already processed in first phase above
+        }
+        else if (beanFactory.isTypeMatch(ppName, PriorityOrdered.class)) {
+            priorityOrderedPostProcessors.add(beanFactory.getBean(ppName, BeanFactoryPostProcessor.class));
+        }
+        else if (beanFactory.isTypeMatch(ppName, Ordered.class)) {
+            orderedPostProcessorNames.add(ppName);
+        }
+        else {
+            nonOrderedPostProcessorNames.add(ppName);
+        }
+    }
+
+    // First, invoke the BeanFactoryPostProcessors that implement PriorityOrdered.
+    sortPostProcessors(beanFactory, priorityOrderedPostProcessors);
+    invokeBeanFactoryPostProcessors(priorityOrderedPostProcessors, beanFactory);
+
+    // Next, invoke the BeanFactoryPostProcessors that implement Ordered.
+    List<BeanFactoryPostProcessor> orderedPostProcessors = new ArrayList<BeanFactoryPostProcessor>();
+    for (String postProcessorName : orderedPostProcessorNames) {
+        orderedPostProcessors.add(beanFactory.getBean(postProcessorName, BeanFactoryPostProcessor.class));
+    }
+    sortPostProcessors(beanFactory, orderedPostProcessors);
+    invokeBeanFactoryPostProcessors(orderedPostProcessors, beanFactory);
+
+    // Finally, invoke all other BeanFactoryPostProcessors.
+    List<BeanFactoryPostProcessor> nonOrderedPostProcessors = new ArrayList<BeanFactoryPostProcessor>();
+    for (String postProcessorName : nonOrderedPostProcessorNames) {
+        nonOrderedPostProcessors.add(beanFactory.getBean(postProcessorName, BeanFactoryPostProcessor.class));
+    }
+    invokeBeanFactoryPostProcessors(nonOrderedPostProcessors, beanFactory);
+
+    // Clear cached merged bean definitions since the post-processors might have
+    // modified the original metadata, e.g. replacing placeholders in values...
+    beanFactory.clearMetadataCache();
+}
+```
+
+#### 5.1、ConfigurationClassPostProcessor#processConfigBeanDefinitions
+
+这个方法的主要功能是实现config bean 的构建和校验，调用链路如下：
+
+```
+PostProcessorRegistrationDelegate#invokeBeanDefinitionRegistryPostProcessors
+    ->ConfigurationClassPostProcessor#postProcessBeanDefinitionRegistry
+        ->ConfigurationClassPostProcessor#processConfigBeanDefinitions
+```
+下面我们看下这个方法的具体实现：
+
+```
+public void processConfigBeanDefinitions(BeanDefinitionRegistry registry) {
+    List<BeanDefinitionHolder> configCandidates = new ArrayList<BeanDefinitionHolder>();
+    String[] candidateNames = registry.getBeanDefinitionNames();
+
+    // 从当前注册的bean中查找所有的配置类，容器刚启动时应该是 main方法所在的类
+    for (String beanName : candidateNames) {
+        BeanDefinition beanDef = registry.getBeanDefinition(beanName);
+        if (ConfigurationClassUtils.isFullConfigurationClass(beanDef) ||
+                ConfigurationClassUtils.isLiteConfigurationClass(beanDef)) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("Bean definition has already been processed as a configuration class: " + beanDef);
+            }
+        }
+        
+        else if (ConfigurationClassUtils.checkConfigurationClassCandidate(beanDef, this.metadataReaderFactory)) {
+            configCandidates.add(new BeanDefinitionHolder(beanDef, beanName));
+        }
+    }
+
+    // Return immediately if no @Configuration classes were found
+    if (configCandidates.isEmpty()) {
+        return;
+    }
+
+    // Sort by previously determined @Order value, if applicable
+    Collections.sort(configCandidates, new Comparator<BeanDefinitionHolder>() {
+        @Override
+        public int compare(BeanDefinitionHolder bd1, BeanDefinitionHolder bd2) {
+            int i1 = ConfigurationClassUtils.getOrder(bd1.getBeanDefinition());
+            int i2 = ConfigurationClassUtils.getOrder(bd2.getBeanDefinition());
+            return (i1 < i2) ? -1 : (i1 > i2) ? 1 : 0;
+        }
+    });
+
+    // Detect any custom bean name generation strategy supplied through the enclosing application context
+    // 设置beanNameGenerator
+    SingletonBeanRegistry sbr = null;
+    if (registry instanceof SingletonBeanRegistry) {
+        sbr = (SingletonBeanRegistry) registry;
+        if (!this.localBeanNameGeneratorSet && sbr.containsSingleton(CONFIGURATION_BEAN_NAME_GENERATOR)) {
+            BeanNameGenerator generator = (BeanNameGenerator) sbr.getSingleton(CONFIGURATION_BEAN_NAME_GENERATOR);
+            this.componentScanBeanNameGenerator = generator;
+            this.importBeanNameGenerator = generator;
+        }
+    }
+
+    // 配置类解析器，分析参考配置类解析一文
+    ConfigurationClassParser parser = new ConfigurationClassParser(
+            this.metadataReaderFactory, this.problemReporter, this.environment,
+            this.resourceLoader, this.componentScanBeanNameGenerator, registry);
+
+    Set<BeanDefinitionHolder> candidates = new LinkedHashSet<BeanDefinitionHolder>(configCandidates);
+    Set<ConfigurationClass> alreadyParsed = new HashSet<ConfigurationClass>(configCandidates.size());
+    do {
+        // 解析当前配置类，这里会通过递归的方式解析出所有的配置类(包括AutoConfig类，@Component)
+        parser.parse(candidates);
+        
+        // 校验已经解析出的所有类
+        // 配置类是否为final类，是否有Configuration 注解等，具体参考ConfigurationClass#validate 实现
+        parser.validate();
+
+        Set<ConfigurationClass> configClasses = new LinkedHashSet<ConfigurationClass>(parser.getConfigurationClasses());
+        configClasses.removeAll(alreadyParsed);
+
+        // BeanDefinition 读取器
+        if (this.reader == null) {
+            this.reader = new ConfigurationClassBeanDefinitionReader(
+                    registry, this.sourceExtractor, this.resourceLoader, this.environment,
+                    this.importBeanNameGenerator, parser.getImportRegistry());
+        }
+        // 这个方法会处理一些特殊的配置类，并且注册当前bean的包含@Bean注解的方法
+        // 具体参考 ConfigurationClassBeanDefinitionReader#loadBeanDefinitionsForConfigurationClass
+        // 这个后续再分析吧
+        this.reader.loadBeanDefinitions(configClasses);
+        alreadyParsed.addAll(configClasses);
+
+        candidates.clear();
+        if (registry.getBeanDefinitionCount() > candidateNames.length) {
+            String[] newCandidateNames = registry.getBeanDefinitionNames();
+            Set<String> oldCandidateNames = new HashSet<String>(Arrays.asList(candidateNames));
+            Set<String> alreadyParsedClasses = new HashSet<String>();
+            for (ConfigurationClass configurationClass : alreadyParsed) {
+                alreadyParsedClasses.add(configurationClass.getMetadata().getClassName());
+            }
+            for (String candidateName : newCandidateNames) {
+                if (!oldCandidateNames.contains(candidateName)) {
+                    
+                    BeanDefinition bd = registry.getBeanDefinition(candidateName);
+                    if (ConfigurationClassUtils.checkConfigurationClassCandidate(bd, this.metadataReaderFactory) &&
+                            !alreadyParsedClasses.contains(bd.getBeanClassName())) {
+                        candidates.add(new BeanDefinitionHolder(bd, candidateName));
+                    }
+                }
+            }
+            candidateNames = newCandidateNames;
+        }
+    }
+    while (!candidates.isEmpty());
+
+    // Register the ImportRegistry as a bean in order to support ImportAware @Configuration classes
+    if (sbr != null) {
+        if (!sbr.containsSingleton(IMPORT_REGISTRY_BEAN_NAME)) {
+            sbr.registerSingleton(IMPORT_REGISTRY_BEAN_NAME, parser.getImportRegistry());
+        }
+    }
+
+    if (this.metadataReaderFactory instanceof CachingMetadataReaderFactory) {
+        ((CachingMetadataReaderFactory) this.metadataReaderFactory).clearCache();
+    }
+}
+```
+
+
