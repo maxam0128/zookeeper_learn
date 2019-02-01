@@ -616,7 +616,6 @@ public static void invokeBeanFactoryPostProcessors(
         sortPostProcessors(beanFactory, orderedPostProcessors);
         registryPostProcessors.addAll(orderedPostProcessors);
         
-        // 
         invokeBeanDefinitionRegistryPostProcessors(orderedPostProcessors, registry);
 
         // Finally, invoke all other BeanDefinitionRegistryPostProcessors until no further ones appear.
@@ -635,7 +634,8 @@ public static void invokeBeanFactoryPostProcessors(
             }
         }
 
-        // Now, invoke the postProcessBeanFactory callback of all processors handled so far.
+        // 调用 BeanFactoryPostProcessor#postProcessBeanFactory 的回调
+        // 可参考 ConfigurationClassPostProcessor#enhanceConfigurationClasses 对配置类的增强
         invokeBeanFactoryPostProcessors(registryPostProcessors, beanFactory);
         invokeBeanFactoryPostProcessors(regularPostProcessors, beanFactory);
     }
@@ -647,14 +647,18 @@ public static void invokeBeanFactoryPostProcessors(
 
     // Do not initialize FactoryBeans here: We need to leave all regular beans
     // uninitialized to let the bean factory post-processors apply to them!
+    // 获取所有的 BeanFactoryPostProcessor 
+    // 注意到这一步不会初始化 FactoryBean。在调用bean factory 的 post-processors 时初始化所有普通的bean
     String[] postProcessorNames =
             beanFactory.getBeanNamesForType(BeanFactoryPostProcessor.class, true, false);
 
-    // Separate between BeanFactoryPostProcessors that implement PriorityOrdered,
-    // Ordered, and the rest.
+    // 可以参考上面的处理
     List<BeanFactoryPostProcessor> priorityOrderedPostProcessors = new ArrayList<BeanFactoryPostProcessor>();
     List<String> orderedPostProcessorNames = new ArrayList<String>();
     List<String> nonOrderedPostProcessorNames = new ArrayList<String>();
+    
+    // 会将PriorityOrdered、Ordered 和其他的处理器分开对待
+    // 这里对于配置文件中的占位符的处理可参考 propertySourcesPlaceholderConfigurer
     for (String ppName : postProcessorNames) {
         if (processedBeans.contains(ppName)) {
             // skip - already processed in first phase above
@@ -670,11 +674,11 @@ public static void invokeBeanFactoryPostProcessors(
         }
     }
 
-    // First, invoke the BeanFactoryPostProcessors that implement PriorityOrdered.
+    // 首先处理实现了 PriorityOrdered 接口的bean，参考 PropertySourcesPlaceholderConfigurer
     sortPostProcessors(beanFactory, priorityOrderedPostProcessors);
     invokeBeanFactoryPostProcessors(priorityOrderedPostProcessors, beanFactory);
 
-    // Next, invoke the BeanFactoryPostProcessors that implement Ordered.
+    // 其次处理实现了 Ordered 接口的 BeanFactoryPostProcessor
     List<BeanFactoryPostProcessor> orderedPostProcessors = new ArrayList<BeanFactoryPostProcessor>();
     for (String postProcessorName : orderedPostProcessorNames) {
         orderedPostProcessors.add(beanFactory.getBean(postProcessorName, BeanFactoryPostProcessor.class));
@@ -682,7 +686,7 @@ public static void invokeBeanFactoryPostProcessors(
     sortPostProcessors(beanFactory, orderedPostProcessors);
     invokeBeanFactoryPostProcessors(orderedPostProcessors, beanFactory);
 
-    // Finally, invoke all other BeanFactoryPostProcessors.
+    // 最后处理其他的 BeanFactoryPostProcessor
     List<BeanFactoryPostProcessor> nonOrderedPostProcessors = new ArrayList<BeanFactoryPostProcessor>();
     for (String postProcessorName : nonOrderedPostProcessorNames) {
         nonOrderedPostProcessors.add(beanFactory.getBean(postProcessorName, BeanFactoryPostProcessor.class));
@@ -695,7 +699,7 @@ public static void invokeBeanFactoryPostProcessors(
 }
 ```
 
-#### 5.1、ConfigurationClassPostProcessor#processConfigBeanDefinitions
+### 5.1、ConfigurationClassPostProcessor#processConfigBeanDefinitions
 
 这个方法的主要功能是实现config bean 的构建和校验，调用链路如下：
 
@@ -819,4 +823,7 @@ public void processConfigBeanDefinitions(BeanDefinitionRegistry registry) {
 }
 ```
 
+## 6、registerBeanPostProcessors
+
+这一步主要是注册bean 的处理器，在bean创建的时候进行拦截。
 
