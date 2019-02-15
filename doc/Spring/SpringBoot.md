@@ -768,7 +768,76 @@ public void contextLoaded(ConfigurableApplicationContext context) {
 
 ## 10、刷新上下文 
 
-这部分内容先略过，具体可参考Spring 应用上下文刷新
+这部分主要是通过 AbstractApplicationContext#refresh 实现上下文刷新，包括bean的加载、依赖注入、启动Servlet 容器等，代码如下：
+
+```
+private void refreshContext(ConfigurableApplicationContext context) {
+    
+    // 刷新上下文
+    refresh(context);
+    
+    // 注册容器关闭钩子
+    if (this.registerShutdownHook) {
+        try {
+            // AbstractApplicationContext#doClose
+            context.registerShutdownHook();
+        }
+        catch (AccessControlException ex) {
+            // Not allowed in some environments.
+        }
+    }
+}
+```
+
+### 10.1、容器关闭
+
+```
+protected void doClose() {
+    
+    // 设置关闭标志位
+    if (this.active.get() && this.closed.compareAndSet(false, true)) {
+        if (logger.isInfoEnabled()) {
+            logger.info("Closing " + this);
+        }
+        
+        // 取消注册的JMX MBean
+        LiveBeansView.unregisterApplicationContext(this);
+
+        try {
+            // 发布上下文关闭事件，这个事件可能不会被处理
+            publishEvent(new ContextClosedEvent(this));
+        }
+        catch (Throwable ex) {
+            logger.warn("Exception thrown from ApplicationListener handling ContextClosedEvent", ex);
+        }
+
+        try {
+            
+            // 停止所有Lifecycle bean
+            getLifecycleProcessor().onClose();
+        }
+        catch (Throwable ex) {
+            logger.warn("Exception thrown from LifecycleProcessor on context close", ex);
+        }
+
+        // Destroy all cached singletons in the context's BeanFactory.
+        // 销毁上下文环境 BeanFactory 中所有的缓存单例bean 
+        // 这里会调用实现了DisposableBean#destroy
+        // 销毁也是先销毁当前bean的依赖，在销毁当前bean
+        destroyBeans();
+
+        // 关闭 BeanFactory
+        closeBeanFactory();
+
+        onClose();
+
+        this.active.set(false);
+    }
+}
+```
+
+
+
 
 ## 11、刷新完成
 
