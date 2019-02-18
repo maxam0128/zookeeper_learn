@@ -78,7 +78,7 @@ protected <T> T doGetBean(
                 }
             }
 
-            // 创建当前bean的实例
+            // 单例情况下创建bean的实例
             if (mbd.isSingleton()) {
                 
                 // 注册bean 对象工厂回调
@@ -100,12 +100,15 @@ protected <T> T doGetBean(
                 });
                 bean = getObjectForBeanInstance(sharedInstance, name, beanName, mbd);
             }
-
+            
+            // 创建bean的原型实例
             else if (mbd.isPrototype()) {
                 // It's a prototype -> create a new instance.
                 Object prototypeInstance = null;
                 try {
+                    // 先判断原型是不是创建中
                     beforePrototypeCreation(beanName);
+                    // 创建bean的实例
                     prototypeInstance = createBean(beanName, mbd, args);
                 }
                 finally {
@@ -114,6 +117,7 @@ protected <T> T doGetBean(
                 bean = getObjectForBeanInstance(prototypeInstance, name, beanName, mbd);
             }
 
+            // 其他情形下，例如说请求、Session 级别下实例的创建
             else {
                 String scopeName = mbd.getScope();
                 final Scope scope = this.scopes.get(scopeName);
@@ -144,12 +148,14 @@ protected <T> T doGetBean(
             }
         }
         catch (BeansException ex) {
+            
+            // 如果bean创建失败，则从 alreadyCreated 列表中移出已经添加的引用
             cleanupAfterBeanCreationFailure(beanName);
             throw ex;
         }
     }
 
-    // Check if required type matches the type of the actual bean instance.
+    // 根据需求类型，将bean转换为对应的类型
     if (requiredType != null && bean != null && !requiredType.isAssignableFrom(bean.getClass())) {
         try {
             return getTypeConverter().convertIfNecessary(bean, requiredType);
@@ -211,9 +217,6 @@ protected Object createBean(String beanName, RootBeanDefinition mbd, Object[] ar
     }
     RootBeanDefinition mbdToUse = mbd;
 
-    // Make sure bean class is actually resolved at this point, and
-    // clone the bean definition in case of a dynamically resolved Class
-    // which cannot be stored in the shared merged bean definition.
     // 解析beanName对应的类，主要是确保将解析好的类已经存储到  merged bean definition
     // 这里会用beanClassLoader类加载器加载bean对应的类
     Class<?> resolvedClass = resolveBeanClass(mbd, beanName);
@@ -278,10 +281,9 @@ protected Object doCreateBean(final String beanName, final RootBeanDefinition mb
         if (!mbd.postProcessed) {
             try {
                 // 应用 MergedBeanDefinitionPostProcessor#postProcessMergedBeanDefinition
-                // 可参考  CommonAnnotationBeanPostProcessor 处理 @Resource、@PostConstruct、@PreDestroy 注解
                 // 1、它会通过InitDestroyAnnotationBeanPostProcessor#buildLifecycleMetadata 对每个bean都包装为LifecycleMetadata
-                // 2、CommonAnnotationBeanPostProcessor#findResourceMetadata 找出当前bean需要注入的元素
-                // AutowiredAnnotationBeanPostProcessor 处理 @Autowired 和 @Value
+                // 2、CommonAnnotationBeanPostProcessor#findResourceMetadata 找出当前bean需要注入的元素，@Resource、@EJB、@WebServiceRef等
+                // 3、AutowiredAnnotationBeanPostProcessor 处理 @Autowired 和 @Value
                 applyMergedBeanDefinitionPostProcessors(mbd, beanType, beanName);
             }
             catch (Throwable ex) {
@@ -375,6 +377,10 @@ protected Object doCreateBean(final String beanName, final RootBeanDefinition mb
 }
 ```
 AbstractAutowireCapableBeanFactory#createBeanInstance
+
+创建bean 实例，创建正常的bean走的流程是通过BeanFactory#getBean 方法来创建bean。
+但是对于某些factoryBean来说，在SpringBoot启动时通过 AbstractAutowireCapableBeanFactory#getSingletonFactoryBeanForTypeCheck
+并将实例化的FactoryBean放到 factoryBeanInstanceCache 缓存中
 ```
 protected BeanWrapper createBeanInstance(String beanName, RootBeanDefinition mbd, Object[] args) {
     // 确保此刻bean已经bean 解析并且已加载
@@ -576,14 +582,12 @@ protected Object initializeBean(final String beanName, final Object bean, RootBe
     Object wrappedBean = bean;
     if (mbd == null || !mbd.isSynthetic()) {
         // 调用BeanPostProcessor#postProcessBeforeInitialization 方法
-
+        // CommonAnnotationBeanPostProcessor->InitDestroyAnnotationBeanPostProcessor#postProcessBeforeInitialization 处理 @PostConstruct 和 @PreDestroy 注解定义的方法
         wrappedBean = applyBeanPostProcessorsBeforeInitialization(wrappedBean, beanName);
     }
 
     try {
-        // 调用初始化方法 
         // 如果bean 实现了 InitializingBean，那么调用 InitializingBean#afterPropertiesSet
-        // 或者处理 @PostConstruct 方法
         invokeInitMethods(beanName, wrappedBean, mbd);
     }
     catch (Throwable ex) {
@@ -601,3 +605,39 @@ protected Object initializeBean(final String beanName, final Object bean, RootBe
     return wrappedBean;
 }
 ```
+
+以上就是bean的创建过程，通过上面分析，我们看下在bean的创建、初始化过程中的几个扩展点。
+
+## 创建bean扩展点
+
+**1、实例化前**
+- 1、BeanPostProcessor#postProcessBeforeInstantiation
+
+
+**2、实例化完成后调用合并bean definition**
+
+- 1、BeanPostProcessor#postProcessMergedBeanDefinition
+
+**3、实例化后**
+
+1、BeanPostProcessor#postProcessAfterInitialization
+
+**4、处理属性值**
+
+这个过程会处理@Resource、@AutoWired、@Valued注解，并注入属性值
+1、BeanPostProcessor#postProcessPropertyValues
+
+通过 下面方法实现对@Valued值的解析
+applyPropertyValues
+
+**5、处理Aware接口
+
+**6、处理 BeanPostProcessor#postProcessBeforeInitialization
+
+这里会通过 InstantiationAwareBeanPostProcessor 处理 PostConstruct、PreDestroy
+
+7、调用 InitializingBean# afterPropertiesSet
+
+8、调用 BeanPostProcessor#postProcessAfterInitialization
+
+9、注册 DisposableBean 接口
