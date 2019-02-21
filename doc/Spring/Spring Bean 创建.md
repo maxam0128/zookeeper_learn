@@ -392,7 +392,7 @@ protected BeanWrapper createBeanInstance(String beanName, RootBeanDefinition mbd
                 "Bean class isn't public, and non-public access not allowed: " + beanClass.getName());
     }
     
-    // 如果当前bean为 factoryBean，则通过 工厂方法
+    // 通过对应的工厂创建bean
     if (mbd.getFactoryMethodName() != null)  {
         return instantiateUsingFactoryMethod(beanName, mbd, args);
     }
@@ -610,7 +610,6 @@ protected Object initializeBean(final String beanName, final Object bean, RootBe
 
 ## 创建bean扩展点
 
-**1、实例化前**
 - 1、BeanPostProcessor#postProcessBeforeInstantiation
 
 
@@ -629,6 +628,7 @@ protected Object initializeBean(final String beanName, final Object bean, RootBe
 
 通过 下面方法实现对@Valued值的解析
 applyPropertyValues
+**1、实例化前**
 
 **5、处理Aware接口
 
