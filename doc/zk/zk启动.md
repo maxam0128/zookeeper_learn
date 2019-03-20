@@ -141,7 +141,7 @@ public void runFromConfig(QuorumPeerConfig config)
       // 设置当前服务器的工厂类
       quorumPeer.setCnxnFactory(cnxnFactory);
       quorumPeer.setSecureCnxnFactory(secureCnxnFactory);
-      // 设置学习者类型，默认都是PARTICIPANT
+      // 设置学习者类型，默认都是 PARTICIPANT
       quorumPeer.setLearnerType(config.getPeerType());
       // 默认是true，它用于观察者
       quorumPeer.setSyncEnabled(config.getSyncEnabled());
